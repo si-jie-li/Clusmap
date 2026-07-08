@@ -212,6 +212,14 @@ def celltype_selection(marker_path, module_path, *, marker_sep="\t", module_sep=
                           .dropna().astype(str).str.upper()) & universe for ct in celltypes}
     valid_cts = [ct for ct in celltypes if ct_markers[ct]]
 
+    if not valid_cts or len(modules) == 0:
+        print("[celltype_selection] no marker genes overlap the module genes — "
+              "check that marker symbols match your gene IDs (case-insensitive). "
+              "Returning no cell types.")
+        if outdir is not None:
+            os.makedirs(os.path.join(outdir, "celltype_selection"), exist_ok=True)
+        return []
+
     p_tab = pd.DataFrame(index=modules, columns=valid_cts, dtype=float)
     N = len(universe)
     for m, mg in mod_genes.items():

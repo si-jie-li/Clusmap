@@ -20,6 +20,14 @@ from .cluster import gen_mod
 from .plot import bulk_hm, cluster_sample_stats
 from .annotate import (compute_pseudo_bulk, pseudo_bulk_hm, sc_marker_hm,
                        celltype_selection, mod_GO)
+from .motif import module_motif
+from .motif_run import motif_pipeline, prepare_module_fastas, run_ame
+from .analysis import (module_eigengenes, hub_genes, top_hubs,
+                       module_trait_correlation, project_modules, module_report,
+                       module_preservation)
+from .pipeline import run_pipeline_from_config
+from .launch import launch_app
+from . import config
 
 __version__ = "0.2.0"
 
@@ -27,5 +35,8 @@ __all__ = [
     "set_working_directory", "import_data", "preprocess", "extract_color_cat",
     "ModuleState", "gen_mod", "bulk_hm", "cluster_sample_stats",
     "compute_pseudo_bulk", "pseudo_bulk_hm", "sc_marker_hm",
-    "celltype_selection", "mod_GO"
+    "celltype_selection", "mod_GO", "module_motif", "run_pipeline_from_config",
+    "motif_pipeline", "prepare_module_fastas", "run_ame", "config",
+    "module_eigengenes", "hub_genes", "top_hubs", "module_trait_correlation",
+    "project_modules", "module_report", "module_preservation", "launch_app",
 ]

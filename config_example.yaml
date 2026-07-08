@@ -1,0 +1,296 @@
+# =============================================================================
+# clusmap — FULL config reference
+# =============================================================================
+# Run with:
+#   import clusmap as cm
+#   ctx = cm.run_pipeline_from_config("config_example.yaml")
+#
+# How this file works
+# --------------------
+# * Each top-level key is the name of a clusmap function. Its sub-keys are
+#   that function's keyword arguments — every single one, set to its default.
+# * A step only runs if its top-level key is PRESENT in the file. Delete or
+#   comment out (#) a whole section to skip that step.
+# * Every value shown is the function's actual default — edit only what you
+#   need; you do not have to fill in the rest.
+# * Dict-valued params named "*_args" (e.g. hm_args, swarm_args) are passed
+#   straight through (**kwargs) to the underlying plotting/analysis library
+#   (seaborn / matplotlib / gseapy). Their sub-keys below are the most useful
+#   ones, not an exhaustive list of that library's API — add any extra kwarg
+#   the library accepts.
+# * null means "use the function's internal default / auto-detect".
+# * Order below is the order clusmap actually runs them in.
+# =============================================================================
+
+
+# --- 0. working directory (optional) ---------------------------------------
+set_working_directory:
+  path: "."                        # cwd for relative paths used below
+
+
+# --- 1. import the expression matrix (REQUIRED) -----------------------------
+import_data:
+  file_path: "data/expression.tsv"  # .tsv / .csv / .xlsx / .h5ad / .pkl (REQUIRED)
+  file_delimiter: null              # null = auto-sniff (csv->",", else tab)
+  header_path: null                 # optional separate file with column (sample) names
+  header_delimiter: "\t"            # delimiter used inside header_path
+  str_col_num: null                 # number of leading non-numeric (annotation) columns;
+                                     #   null = auto-detect
+  float_col_num: null                # number of trailing numeric (sample) columns;
+                                     #   null = auto-detect
+  index_col: 1                      # 1-based column to use as the gene index
+  layer: null                       # for .h5ad only: which .layers[...] to read (null = .X)
+
+
+# --- 2. derive sample annotation colors from column names (optional) -------
+extract_color_cat:
+  case_sensitive: false
+  categories_dict:                  # band_name -> {category_label: [substrings to match
+                                     #   in column names]}; null = skip this step
+    tissue:
+      brain: ["brain", "ctx", "hippo"]
+      liver: ["liver", "hep"]
+    timepoint:
+      early: ["d0", "d1", "d2"]
+      late: ["d7", "d14"]
+
+
+# --- 3. preprocess (filter / log-transform) ---------------------------------
+preprocess:
+  start: null                       # first sample column to keep (null = all)
+  end: null                         # last sample column to keep (null = all)
+  min_expr: 10                      # drop genes whose max expression < this
+  log_base: 2                       # log-transform base; null = no log transform
+  plus_constant: 0.1                # pseudocount added before log
+  std_filter: true                  # drop zero-variance (constant) genes
+
+
+# --- 4. hierarchical clustering + dynamic tree cut (REQUIRED for downstream)-
+gen_mod:
+  method: "average"                 # scipy linkage method: average/complete/single/ward/...
+  metric: "correlation"             # scipy pdist metric: correlation/euclidean/cosine/...
+  outdir: "clusmap_out"             # null = don't write files
+  link: null                        # advanced: precomputed linkage matrix (set in code, not YAML)
+  deepSplit: 1                      # 0 (coarse) .. 4 (fine) — main tuning knob
+  minClusterSize: 30                # main tuning knob
+  pamStage: false
+  save_raw: false                   # also dump modules.pkl + linkage.pkl (redundant w/ module_state.pkl)
+  # --- any extra dynamicTreeCut.cutreeHybrid kwarg also goes here, e.g.: ---
+  cutHeight: null
+  maxCoreScatter: null
+  minGap: null
+  maxAbsCoreScatter: null
+  minAbsGap: null
+  minSplitHeight: null
+  minAbsSplitHeight: null
+  minExternalSplit: null
+  pamRespectsDendro: true
+  useMedoids: false
+  maxPamDist: null
+  respectSmallClusters: true
+  verbose: 2
+
+
+# --- 5. cluster heatmap figure -----------------------------------------------
+bulk_hm:
+  norm_method: "z_score"            # z_score / centralize / min_max / max / none
+  title: null                       # null = auto-generated
+  xtickangle: 90
+  yticksize: 5
+  goi_list: null                    # list of gene names to force-label, e.g. ["Sox2","Gapdh"]
+  goi_size: 10
+  mod_palette: "hsv"                # any seaborn/matplotlib palette name
+  mod_num_left: 0.01                # fraction of x-axis width for left-side module numbers
+  mod_num_right: 0.03               # fraction of x-axis width for right-side module numbers
+  col_palette: "tab20"              # palette for column (sample) color bands
+  col_legend: null                  # list of band names to draw a legend for, e.g. ["tissue"]
+  row_band: true                    # draw the module-color band beside the heatmap
+  outdir: "clusmap_out"
+  save_format: "png"                # png / pdf / svg
+  mod_num_font:                     # font kwargs for the module-number labels
+    fontsize: 5
+    fontweight: "bold"
+  row_band_font:                    # appearance of the module-color row band
+    band_width: 0.03
+    alpha: 0.35
+    band_gap: 0
+  col_color_manual: null            # override auto colors per band/category:
+                                     #   {band_name: {category_label: "#hexcolor"}}
+  col_cat: null                     # usually auto-filled from extract_color_cat; set
+                                     #   manually only if skipping that step
+  hm_args:                          # passed straight to seaborn.clustermap
+    robust: true                    # clip color range to 2nd/98th percentile
+    yticklabels: false
+    xticklabels: "auto"             # true to draw all gene names, "auto", or false
+    cmap: "turbo"
+    col_cluster: true
+    vmin: null
+    vmax: null
+    figsize: null                   # null = auto-sized from data
+    dendrogram_ratio: null          # null = auto
+    cbar_pos: "DEFAULT"             # "DEFAULT" placement, null to hide, or [x,y,w,h]
+
+
+# --- 6. per-cluster sample statistics ---------------------------------------
+cluster_sample_stats:
+  hm_mod_gene_path: "clusmap_out/HM_ModGene.csv"
+  module_col: "hm_mod"
+  gene_col: "gene"
+  stats: null                       # null = ["mean","median","std"]; or pick a subset
+  outdir: "clusmap_out"
+  save_heatmap: true
+
+
+# --- 7a. pseudo-bulk from single-cell (only if annotating via single-cell) --
+compute_pseudo_bulk:
+  h5ad_file: "data/singlecell.h5ad"
+  celltype_key: "celltype"          # adata.obs column with cell-type labels
+  layer: null                       # null = use .X
+  outdir: "clusmap_out"
+  log_base: null                    # null = leave as-is (set 2 if .h5ad holds raw counts)
+  plus_constant: 0.1
+  chunk_size: null                  # set e.g. 5000 for memory-efficient backed reads on big atlases
+
+pseudo_bulk_hm:
+  pseudo_bulk_path: null            # path to a saved pseudo_bulk.tsv; leave null if
+                                     #   compute_pseudo_bulk ran just above (auto-wired)
+  pseudo_bulk_sep: "\t"
+  log_base: null
+  plus_constant: 0.1
+  norm_method: "z_score"
+  xtickangle: 0
+  cbar_pos: null                    # [x,y,w,h] in figure coords, or null
+  left_gap: 0.08                    # gap between the main heatmap and this panel
+  col_width: 0.1                    # per-column width, scaled by number of cell types
+  title: "Pseudo Bulk Heatmap"
+  title_size: 10
+  outdir: "clusmap_out"
+  save_format: "png"
+  pseudo_hm_args:                   # passed straight to seaborn.heatmap
+    robust: true
+    cmap: "turbo"
+    cbar: true
+
+
+# --- 7b. marker-based annotation (only if annotating via markers) ----------
+celltype_selection:
+  marker_path: "data/PanglaoDB_markers.tsv"
+  module_path: "clusmap_out/HM_ModGene.csv"
+  marker_sep: "\t"
+  module_sep: ","
+  marker_col_celltype: "cell type"
+  marker_col_gene: "official gene symbol"
+  module_col_gene: "gene"
+  module_col_module: "hm_mod"
+  p_val_threshold: 0.05
+  max_celltypes_per_module: 5
+  outdir: "clusmap_out"
+  hm_cmap: "Reds"
+  heatmap_top_n_celltypes: 30
+
+sc_marker_hm:
+  marker_file: "data/PanglaoDB_markers.tsv"
+  sep: "\t"
+  celltype_col: "celltype"
+  gene_col: "gene"
+  celltype: null                    # null = use celltype_selection's output (auto-wired);
+                                     #   or give an explicit list of cell-type names
+  left_gap: 0.08
+  col_width: 0.1
+  title: "Marker Gene Swarm Plot"
+  spine: true
+  marker_show: false                # label individual marker genes on the y-axis
+  outdir: "clusmap_out"
+  save_format: "png"
+  axhspan_args:                     # passed to ax.axhspan (the module-color background bands)
+    alpha: 0.1
+  swarm_args: {}                    # passed to seaborn.swarmplot, e.g. {size: 4, color: "black"}
+
+
+# --- 8. GO enrichment --------------------------------------------------------
+mod_GO:
+  modgene_path: "clusmap_out/HM_ModGene.csv"
+  bg: null                          # background gene universe DataFrame (advanced; set in code)
+  module_col: "hm_mod"
+  gene_col: "gene"
+  organism: "Mouse"                 # gseapy/Enrichr organism: Mouse/Human/Yeast/Fly/...
+  library: null                     # null = auto-pick latest GO_*_<year> Enrichr libraries;
+                                     #   or give explicit names, e.g. ["KEGG_2021_Human"]
+  GO_category: ["BP", "MF"]         # subset of BP/MF/CC, used only when library is null
+  outdir: "clusmap_out/GO"
+  mod: null                         # list of module numbers to restrict to (null = all)
+  barplot: null                     # null = auto (true only if bg given)
+  dotplot: null                     # null = auto (true only if bg is null)
+  barplot_args: {}                  # passed to gseapy.plot.barplot
+  dotplot_args: {}                  # passed to gseapy.plot.dotplot
+  enrichr_args: {}                  # passed to gseapy.enrichr, e.g. {gene_sets: [...]}
+
+
+# --- 9. motif enrichment (HPC-capable; needs MEME-suite `ame`) --------------
+motif_pipeline:
+  modgene_path: "clusmap_out/HM_ModGene.csv"
+  outdir: "motif_out"
+  promoter_fasta: null              # null = resolve from ~/.clusmap/config.yaml
+                                     #   (or clusmap.config.builtin_motif("human"/"mouse")
+                                     #   once bundled refs ship — see clusmap-config)
+  motif_dbs: null                   # null = resolve from config motif_db.*; or an explicit
+                                     #   list of .meme paths, e.g. ["/db/JASPAR2026.meme"]
+  run_mode: null                    # null = use config (local/slurm/ssh)
+  min_genes: null                   # null = use config min_genes_for_ame (default 50)
+  evalue: null                      # null = use config ame_evalue (default 1.0)
+  wrap_mode: "top_n"                # how module_motif (called internally) wraps AME results:
+                                     #   top_n / p / e / pe
+  dry_run: false                    # true = build commands/scripts without submitting/running
+
+
+# --- 10. WGCNA-style downstream analyses ------------------------------------
+module_eigengenes:
+  outdir: "clusmap_out"             # writes module_eigengenes.tsv
+
+hub_genes:
+  eigengenes: null                  # null = use module_eigengenes' output (auto-wired)
+  top_n: 20                         # how many top-kME genes per module to flag as hubs
+  outdir: "clusmap_out"             # writes hub_genes.tsv
+
+module_trait_correlation:
+  trait_file: "data/sample_traits.tsv"   # samples x traits table (REQUIRED for this step)
+  trait_sep: "\t"
+  trait_index_col: 0
+  outdir: "clusmap_out"
+  save_heatmap: true
+
+module_preservation:
+  n_perm: 200                       # number of random gene-set permutations
+  min_genes: 5                      # skip modules smaller than this
+  seed: 0
+  outdir: "clusmap_out"
+  test_import_data:                 # the dataset to test preservation IN (full import_data
+                                     #   kwargs, same fields as the "import_data" section above)
+    file_path: "data/expression_test_cohort.tsv"
+    file_delimiter: null
+    header_path: null
+    header_delimiter: "\t"
+    str_col_num: null
+    float_col_num: null
+    index_col: 1
+    layer: null
+
+project_modules:
+  min_cor: 0.5                      # minimum eigengene correlation to accept an assignment
+  outdir: "clusmap_out"
+  new_import_data:                  # the new dataset to assign modules to (full import_data
+                                     #   kwargs, same fields as the "import_data" section above)
+    file_path: "data/expression_new_dataset.tsv"
+    file_delimiter: null
+    header_path: null
+    header_delimiter: "\t"
+    str_col_num: null
+    float_col_num: null
+    index_col: 1
+    layer: null
+
+module_report:
+  outdir: "clusmap_out"             # also where the report's own files are written
+  eigengenes: null                  # null = use module_eigengenes' output (auto-wired)
+  hub_df: null                      # null = use hub_genes' output (auto-wired)
+  report_name: "module_report.html"

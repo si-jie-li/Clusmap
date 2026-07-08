@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clusmap"
+version = "0.2.0"
+description = "Bulk RNA-seq module discovery, clusterheatmaps, and annotation (single-cell, GO, motif)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Cindy Li", email = "lisheng607@gmail.com" }]
+keywords = ["RNA-seq", "clustering", "heatmap", "WGCNA", "bioinformatics", "motif", "GO"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Operating System :: OS Independent",
+]
+
+# Core dependencies — enough for clustering + heatmaps + GO + motif wrap-up.
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "seaborn",
+    "matplotlib",
+    "statsmodels",
+    "dynamicTreeCut",
+    "gseapy",
+    "PyYAML",
+]
+
+[project.optional-dependencies]
+sc = ["anndata", "scikit-learn"]          # single-cell pseudo-bulk
+app = ["streamlit>=1.35", "plotly"]       # interactive heatmap
+agent = ["anthropic"]                     # conversational Claude agent (default backend)
+excel = ["openpyxl"]                      # .xlsx input
+all = ["anndata", "scikit-learn", "streamlit>=1.35", "plotly", "anthropic", "openpyxl"]
+dev = ["pytest", "build", "twine"]
+
+[project.urls]
+Homepage = "https://github.com/lisheng607/clusmap"
+Issues = "https://github.com/lisheng607/clusmap/issues"
+
+[project.scripts]
+clusmap-config = "clusmap.config:_cli"
+clusmap-agent = "clusmap.agent.runner:main"
+
+[tool.setuptools]
+packages = ["clusmap", "clusmap.agent"]
+
+[tool.setuptools.package-data]
+clusmap = ["py.typed"]
