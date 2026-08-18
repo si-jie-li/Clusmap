@@ -17,7 +17,10 @@ from .io import (set_working_directory, import_data, preprocess,
                  extract_color_cat, TableStructure)
 from .state import ModuleState
 from .cluster import gen_mod
-from .plot import bulk_hm, cluster_sample_stats
+from .plot import bulk_hm, cluster_sample_stats, module_color_map
+from .spatial import (SpatialDataset, import_spatial, from_adata, select_hvgs,
+                      spatial_module_scores, assign_spots_to_modules,
+                      plot_spatial_modules, plot_spatial_expression)
 from .annotate import (compute_pseudo_bulk, pseudo_bulk_hm, sc_marker_hm,
                        celltype_selection, mod_GO)
 from .motif import module_motif
@@ -34,6 +37,9 @@ __version__ = "0.2.0"
 __all__ = [
     "set_working_directory", "import_data", "preprocess", "extract_color_cat",
     "TableStructure", "ModuleState", "gen_mod", "bulk_hm", "cluster_sample_stats",
+    "module_color_map", "SpatialDataset", "import_spatial", "from_adata",
+    "select_hvgs", "spatial_module_scores", "assign_spots_to_modules",
+    "plot_spatial_modules", "plot_spatial_expression",
     "compute_pseudo_bulk", "pseudo_bulk_hm", "sc_marker_hm",
     "celltype_selection", "mod_GO", "module_motif", "run_pipeline_from_config",
     "motif_pipeline", "prepare_module_fastas", "run_ame", "config",

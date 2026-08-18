@@ -31,6 +31,21 @@ def _module_colors(state: ModuleState, palette: str):
     return rgb, hex_arr
 
 
+def module_color_map(state: ModuleState, palette: str = "hsv") -> Dict[int, str]:
+    """``{hm_module_id: hex}`` colour map, consistent with ``bulk_hm``'s colours.
+
+    1-based heatmap module id -> hex colour (0 / unassigned -> ``"#ffffff"``).
+    Reuses the same palette/ordering as ``bulk_hm`` so any spatial rendering
+    coloured with this map matches the heatmap exactly.
+    """
+    _, hex_arr = _module_colors(state, palette)
+    cmap: Dict[int, str] = {}
+    for m, c in zip(state.hm_labels, hex_arr):
+        cmap.setdefault(int(m), str(c))
+    cmap[0] = "#ffffff"
+    return cmap
+
+
 def _shrink_xticklabels(ax, angle: int) -> float:
     """Shrink x tick font until adjacent labels stop overlapping. Returns fs."""
     fig = ax.get_figure()

@@ -37,7 +37,8 @@ sc = ["anndata", "scikit-learn"]          # single-cell pseudo-bulk
 app = ["streamlit>=1.35", "plotly"]       # interactive heatmap
 agent = ["anthropic"]                     # conversational Claude agent (default backend)
 excel = ["openpyxl"]                      # .xlsx input
-all = ["anndata", "scikit-learn", "streamlit>=1.35", "plotly", "anthropic", "openpyxl"]
+spatial = ["h5py"]                        # 10x Visium .h5 reading (spatial transcriptomics)
+all = ["anndata", "scikit-learn", "streamlit>=1.35", "plotly", "anthropic", "openpyxl", "h5py"]
 dev = ["pytest", "build", "twine"]
 
 [project.urls]

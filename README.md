@@ -17,7 +17,8 @@ pip install "clusmap[all]"          # + single-cell, interactive app, agent, xls
 ```
 
 Optional extras: `sc` (single-cell pseudo-bulk), `app` (Streamlit/Plotly
-interactive heatmap), `agent` (Claude agent), `excel` (.xlsx input).
+interactive heatmap), `agent` (Claude agent), `excel` (.xlsx input), `spatial`
+(10x Visium `.h5` reading).
 
 ## Quick start
 
@@ -66,6 +67,30 @@ docker run --rm -v $PWD:/work -w /work -v /data:/data clusmap \
 ```
 
 Genome/promoter prep scripts are in [`motif_analysis/`](motif_analysis).
+
+## Spatial transcriptomics (Visium)
+
+Treat a spot as a pseudo-bulk sample: `import_spatial` reads a 10x Visium output
+directory into a gene × spot matrix, then the same clustering engine finds gene
+modules, and `plot_spatial_expression` / `plot_spatial_modules` render each
+module across the tissue over the H&E image (colours match the heatmap).
+
+```python
+import clusmap as cm
+sdata = cm.import_spatial("V1_Mouse_Brain_Sagittal_Posterior", image="lowres")
+rna   = cm.select_hvgs(sdata.rna, n_top=2000)     # 32k genes -> 2k for tractability
+rna   = cm.preprocess(rna)
+state = cm.gen_mod(rna, deepSplit=1, minClusterSize=30, outdir="spatial_out")
+
+scores = cm.spatial_module_scores(rna, state, method="mean")   # spots x modules
+cm.plot_spatial_expression(scores, sdata.coords, image=sdata.image,
+                           scale_factors=sdata.scale_factors, outdir="spatial_out")
+cm.plot_spatial_modules(sdata.coords, cm.assign_spots_to_modules(scores),
+                        state=state, image=sdata.image, outdir="spatial_out")
+```
+
+Run the full demo end-to-end: `python demo_spatial.py`. Requires
+`pip install "clusmap[spatial]"` (adds `h5py`).
 
 ## Publishing checklist
 
