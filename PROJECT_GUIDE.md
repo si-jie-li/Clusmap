@@ -51,9 +51,11 @@ import_data (io.py) → preprocess (io.py) → gen_mod (cluster.py) → ModuleSt
       → analysis.py (eigengenes, hub_genes, trait_correlation, preservation, projection, report)
       → motif_run.py (motif_pipeline → AME) → motif.py (module_motif wrap-up)
 
-spatial (10x Visium, spot = pseudo-bulk): import_spatial (spatial.py) → select_hvgs
-      → preprocess → gen_mod → spatial_module_scores (mean / eigengene per spot)
-      → plot_spatial_expression | plot_spatial_modules
+spatial (10x Visium, spot = pseudo-bulk): import_spatial (spatial.py, folder or .h5ad)
+      → run_leiden (scanpy pipeline → obs['leiden'] spot clusters) → gen_mod (gene modules
+      on the log1p-HVG gene×spot matrix) → spatial_hm (two-version bulk_hm, Leiden col band)
+      → add_module_expression → plot_spatial_modules (Leiden) | plot_spatial_expression (per-module mean)
+      → sc_marker_hm + celltype_selection (swarmplot)
 ```
 
 ### 1.3 Three front-ends, one engine
@@ -141,7 +143,7 @@ cm.mod_GO("out/HM_ModGene.csv", organism="Mouse")
 | 16 | HTML report | `cm.module_report` | `module_report.html` |
 | 17 | Curate modules | `state.split/merge/reassign/save` | updated state + `HM_ModGene.csv` |
 | 18 | Everything at once (YAML) | `cm.run_pipeline_from_config` | all of the above |
-| 19 | Spatial transcriptomics (10x Visium) | `cm.import_spatial` → `select_hvgs` → `gen_mod` → `spatial_module_scores` → `plot_spatial_expression` / `plot_spatial_modules` | `spatial_module_expression.png` (per-module expression grid) · `spatial_modules.png` (spot → module map) · `spatial_module_scores.tsv` |
+| 19 | Spatial transcriptomics (10x Visium) | `cm.import_spatial` (folder or `.h5ad`) → `gen_mod` → `spatial_hm` (two-version heatmap) → `plot_spatial_modules` (Leiden) / `plot_spatial_expression` (per-module mean) | `spatial_modules.png` (Leiden spot clusters) · `spatial_module_expression.png` (per-gene-module mean expr) · `spatial_heatmap_v1/v2.png` · `heatmap_swarm.png` |
 
 ### 2.4 Concrete end-to-end examples
 
@@ -346,38 +348,39 @@ implement the `LLMBackend` protocol (see `OpenAIBackend` in
 #### Example J — spatial transcriptomics (10x Visium)
 
 A spot is a pseudo-bulk sample, so spatial data flows through the same engine as
-bulk — `gene × sample` becomes `gene × spot`. Then each module's expression is
-rendered back onto the tissue (over the H&E image). Requires `pip install
-"clusmap[spatial]"` (adds `h5py`).
+bulk — `gene × sample` becomes `gene × spot`. Requires `pip install
+"clusmap[spatial]"` (adds `h5py`, `scanpy`, `leidenalg`). Two kinds of module
+coexist: **Leiden spot clusters** (spot modules, from the scanpy pipeline) and
+**gene modules** (`gen_mod`).
 
 ```python
 import clusmap as cm
 
-# (1) load a Space Ranger output dir (auto-detects the .h5 / mtx + coords + H&E)
-sdata = cm.import_spatial("V1_Mouse_Brain_Sagittal_Posterior", image="lowres")
-sdata.rna                  # genes x spots (columns = spot barcodes)
-sdata.coords               # barcode -> x, y (full-res pixels)
+# (1) load a Visium output folder OR a pre-made .h5ad; auto-preprocess + Leiden
+sdata = cm.import_spatial("V1_Mouse_Brain_Sagittal_Posterior")   # or "brain.h5ad"
+sdata.adata                # AnnData: obs['leiden'] (spot clusters), obsm['spatial'], H&E
+sdata.rna                  # genes x spots log1p-HVG matrix (for the clusmap engine)
+sdata.leiden               # spot -> Leiden cluster
 
-# (2) cluster on the top highly-variable genes (32k genes -> 2k), then as usual
-rna   = cm.select_hvgs(sdata.rna, n_top=2000)
-rna   = cm.preprocess(rna)
-state = cm.gen_mod(rna, deepSplit=1, minClusterSize=30, outdir="spatial_out")
+# (2) gene modules (module formed by genes), then as usual
+state = cm.gen_mod(sdata.rna, deepSplit=1, minClusterSize=30, outdir="spatial_out")
 
-# (3) per-spot module expression + two spatial views
-scores = cm.spatial_module_scores(rna, state, method="mean")   # spots x modules (z-scored)
-cm.plot_spatial_expression(scores, sdata.coords, image=sdata.image,
-                           scale_factors=sdata.scale_factors, outdir="spatial_out")
-assign = cm.assign_spots_to_modules(scores)                    # spot -> strongest module
-cm.plot_spatial_modules(sdata.coords, assign, state=state, image=sdata.image,
-                        scale_factors=sdata.scale_factors, outdir="spatial_out")
+# (3) two-version clusterheatmap (reuses bulk_hm; Leiden = default column band)
+hm_v1, hm_v2 = cm.spatial_hm(sdata.adata, sdata.rna, state, outdir="spatial_out")
+
+# (4) spatial plots via sc.pl.spatial over the H&E image
+cm.add_module_expression(sdata.adata, sdata.rna, state)   # module mean expr -> obs
+cm.plot_spatial_modules(sdata.adata, outdir="spatial_out")        # Leiden clusters
+cm.plot_spatial_expression(sdata.adata, outdir="spatial_out")     # per-gene-module mean expr
 ```
 
-`plot_spatial_expression` draws **one subplot per module** showing that module's
-mean expression across the tissue (coloured on a shared z-score scale, H&E
-underneath); `plot_spatial_modules` colours each spot by the module it most
-strongly expresses, using the **same colours as the heatmap**. To zoom into a
-single module interactively, export its genes from `HM_ModGene.csv` and load them
-in **cellxgene** (https://cellxgene.cziscience.com) against the same Visium
+`spatial_modules.png` shows the **Leiden** spot clusters (a module formed *by
+spots*); `spatial_module_expression.png` shows the **mean expression of each
+gene module** (a module formed *by genes*) across the tissue — one subplot per
+module. `spatial_hm` v1 clusters rows and columns; v2 groups columns by Leiden
+cluster (clustered within each group). To zoom into a single gene module
+interactively, export its genes from `HM_ModGene.csv` and load them in
+**cellxgene** (https://cellxgene.cziscience.com) against the same Visium
 `.h5ad` — see §14 of USAGE.md. Full runnable script: `python demo_spatial.py`.
 
 ### 2.5 All output files, explained
@@ -404,9 +407,11 @@ in **cellxgene** (https://cellxgene.cziscience.com) against the same Visium
 | `module_report.html` | Self-contained report: size, preservation, eigengene sparkline, hub genes, GO/celltype/motif. |
 | `cluster_sample_<stat>.tsv` (+ heatmap) | Per-module × sample summary stats. |
 | `pseudo_bulk.tsv` | genes × cell types mean expression. |
-| `spatial_module_expression.png` | One subplot per module: its mean expression across the tissue (H&E overlay, shared z-score scale). |
-| `spatial_modules.png` | Spot → module map (each spot coloured by its strongest module, heatmap colours). |
-| `spatial_module_scores.tsv` | spots × modules score table (for your own downstream tools). |
+| `spatial_heatmap_v1.png` | Gene x spot clusterheatmap, rows + columns both clustered (reuses `bulk_hm`). |
+| `spatial_heatmap_v2.png` | Rows clustered, columns grouped by Leiden cluster (clustered within group), `col_cluster=False`. |
+| `spatial_modules.png` | **Leiden** spot clusters over the H&E image (`sc.pl.spatial(adata, color='leiden')`). |
+| `spatial_module_expression.png` | One subplot per **gene module**: its mean per-spot expression over the H&E image. |
+| `heatmap_swarm.png` | Heatmap + marker-celltype swarmplot (`sc_marker_hm` after `celltype_selection`). |
 
 ### 2.6 Config & knobs you'll actually touch
 
@@ -438,7 +443,7 @@ Clusmap/
 │   ├── plot.py              # bulk_hm, cluster_sample_stats, module_color_map
 │   ├── annotate.py          # pseudo-bulk, swarm, celltype_selection, mod_GO
 │   ├── analysis.py          # eigengenes, hubs, traits, preservation, projection, report
-│   ├── spatial.py           # import_spatial / from_adata / select_hvgs / spatial scoring + plots
+│   ├── spatial.py           # import_spatial / run_leiden / spatial_hm / sc.pl.spatial plots
 │   ├── motif.py             # module_motif — AME result wrap-up
 │   ├── motif_run.py         # motif_pipeline / prepare_module_fastas / run_ame
 │   ├── config.py            # ~/.clusmap/config.yaml system + clusmap-config CLI
@@ -460,7 +465,7 @@ Clusmap/
 ├── motif_analysis/          # HPC/genome prep scripts (source of truth for motif prep)
 ├── PanglaoDB_marker.tsv     # bundled marker reference (8286 rows)
 ├── config_example.yaml      # full parameter reference for the batch pipeline
-├── demo_spatial.py          # end-to-end spatial (10x Visium) demo
+├── demo_spatial.py          # end-to-end spatial demo (folder or .h5ad) -> heatmaps + sc.pl.spatial plots
 ├── demo_out/, clusmap_out/  # example data + already-computed outputs (git-ignored)
 ├── pyproject.toml           # packaging, extras, console scripts
 ├── Dockerfile               # clusmap + MEME-suite + bedtools + samtools image
@@ -472,10 +477,12 @@ Clusmap/
 
 #### [`clusmap/__init__.py`](clusmap/__init__.py) — public API surface
 Re-exports 35+ names (see the `__all__` list), including the spatial API
-(`import_spatial`, `from_adata`, `select_hvgs`, `spatial_module_scores`,
-`assign_spots_to_modules`, `plot_spatial_modules`, `plot_spatial_expression`,
-`module_color_map`, `SpatialDataset`). **Add a new public function here** if it
-should be importable as `cm.<name>`. Also holds `__version__ = "0.2.0"`.
+(`import_spatial`, `from_adata`, `run_leiden`, `select_hvgs`,
+`spatial_module_scores`, `assign_spots_to_modules`, `add_module_expression`,
+`sort_columns_by_leiden`, `spatial_hm`, `plot_spatial_modules`,
+`plot_spatial_expression`, `module_color_map`, `SpatialDataset`). **Add a new
+public function here** if it should be importable as `cm.<name>`. Also holds
+`__version__ = "0.2.0"`.
 
 #### [`clusmap/state.py`](clusmap/state.py) — `ModuleState`
 The heart of the package. A `@dataclass` holding `genes`, `linkage`,
@@ -586,37 +593,41 @@ All built on `ModuleState`, no WGCNA dependency:
   `outdir`.
 
 #### [`clusmap/spatial.py`](clusmap/spatial.py) — spatial transcriptomics (10x Visium)
-Treats a spot as a pseudo-bulk so the whole engine runs unchanged on a
-gene × spot matrix. Nothing here re-implements the engine.
+Scanpy-centric. Treats a spot as a pseudo-bulk so the whole engine runs unchanged
+on a gene × spot matrix; the spatial rendering itself is plain `sc.pl.spatial`.
 
-- `SpatialDataset` — dataclass holding `rna` (genes × spots), `coords`
-  (barcode → x/y full-res pixels), `scale_factors`, `image` / `image_hires`
-  (H&E PNG paths, or image arrays from AnnData).
-- `import_spatial(path)` — auto-detects `filtered_feature_bc_matrix.h5` (or the
-  mtx dir), `spatial/tissue_positions[_list].csv`, `scalefactors_json.json` and
-  the H&E PNGs. Reads the 10x H5 **manually** with `h5py` + `scipy.sparse.csc_matrix`
-  (no scanpy dependency), densifies to genes × spots, de-duplicates gene names
-  via `_make_unique`.
-- `from_adata(adata)` — converts a scanpy `read_visium` AnnData (uses
-  `obsm["spatial"]` + `uns` scale factors/images) for users already on scanpy.
-- `select_hvgs(rna, n_top)` — pure-pandas variance/dispersion-based HVG subset so
-  clustering a 30k-gene matrix stays tractable (`pdist` is O(n²)).
-- `spatial_module_scores(rna, state, method=...)` — spots × modules score table:
-  `method="mean"` (mean of the module's genes per spot) or `"eigengene"`
-  (delegates to `analysis.module_eigengenes`); `norm` z-scores/min-max scales each
-  module so they share one colour scale. Columns are 1-based `hm_mod` ids.
-- `assign_spots_to_modules(scores, min_score=...)` — spot → strongest module
-  (`idxmax`), with an optional threshold that leaves weak spots unassigned (0).
-- `plot_spatial_expression(scores, coords, image=..., scale_factors=...)` — a
-  grid, one subplot per module, each a spatial scatter coloured by that module's
-  score over the H&E image.
-- `plot_spatial_modules(coords, assignment, state=...)` — a single discrete map
-  colouring each spot by its module, using `plot.module_color_map` so the colours
-  match the heatmap.
+- `SpatialDataset` — dataclass holding `adata` (the AnnData: `obs['leiden']`,
+  `obsm['spatial']`, `uns['spatial']`), `rna` (genes × spots log1p-HVG matrix for
+  the clusmap engine), plus convenience `coords` / `scale_factors` / `image`.
+- `import_spatial(path)` — accepts **either** a 10x Visium folder
+  (`sc.read_visium`) **or** a `.h5ad` file (`sc.read_h5ad`); robust to both.
+  When the data has no `leiden` yet it runs the scanpy pipeline via `run_leiden`.
+- `run_leiden(adata, n_top_genes=..., resolution=...)` — normalize → log1p → HVG
+  → scale → PCA → neighbors → Leiden; adds `obs['leiden']` (spot clusters, a
+  module formed *by spots*). Skips steps the AnnData already has.
+- `from_adata(adata)` — wraps any (Visium) AnnData into a `SpatialDataset`.
+- `spatial_hm(adata, rna, state, ...)` — **two-version** clusterheatmap reusing
+  `bulk_hm`: v1 rows+columns clustered; v2 columns grouped by Leiden (clustered
+  within group, `col_cluster=False`). Leiden is the default `col_cat` column
+  band; pass `col_cat` to add more. Saves `spatial_heatmap_v1/v2.png`.
+- `sort_columns_by_leiden(rna, leiden)` — pre-sorts spots by Leiden group,
+  clustered within each group (feeds v2).
+- `add_module_expression(adata, rna, state)` — drops each **gene module's** mean
+  per-spot expression into `adata.obs['module_<id>_expr']` (z-scored by default).
+- `spatial_module_scores(rna, state, method=...)` — spots × modules score table
+  (`method="mean"` | `"eigengene"`, delegated to `analysis.module_eigengenes`).
+- `plot_spatial_modules(adata, ...)` — `sc.pl.spatial(adata, color='leiden',
+  img_key='hires')`: the **Leiden** spot-cluster map (`spatial_modules.png`).
+- `plot_spatial_expression(adata, ...)` — `sc.pl.spatial` grid, one subplot per
+  **gene module** showing its mean expression over the H&E image
+  (`spatial_module_expression.png`).
+- `assign_spots_to_modules(scores, min_score=...)` / `select_hvgs(rna, n_top)` —
+  kept utilities (spot → strongest gene module; pure-pandas HVG subset).
 
-**Where to touch**: to change how spots are scored, edit `spatial_module_scores`;
-to change the spatial rendering, edit `_draw_spatial_base` /
-`plot_spatial_expression` / `plot_spatial_modules`.
+**Where to touch**: to change the scanpy preprocessing, edit `run_leiden`; to
+change the spatial rendering, edit `plot_spatial_modules` /
+`plot_spatial_expression` (both thin `sc.pl.spatial` wrappers); to change the
+heatmap, edit `spatial_hm` / `sort_columns_by_leiden`.
 
 #### [`clusmap/motif.py`](clusmap/motif.py) — AME result wrap-up
 `module_motif(root_dir, outdir, mode=...)` — globs `root_dir/Module*/ame.tsv`,
@@ -735,10 +746,13 @@ points at `runner:main`).
 - `tests/test_import_data_detect.py` — end-to-end `import_data` tests (standard,
   junk rows before header, gene in col 2, transposed, numeric gene names, numeric
   sample names, legacy override path, and a `gen_mod` smoke test).
-- `tests/test_spatial.py` — headless spatial tests: `module_color_map` consistency
-  with `_module_colors`, `assign_spots_to_modules` argmax + cutoff, coordinate
-  parsing (header/no-header), `select_hvgs`, `spatial_module_scores` (mean/z-score),
-  and the `import_spatial` missing-file error path.
+- `tests/test_spatial.py` — headless spatial tests (synthetic Visium-like AnnData,
+  no downloads): `import_spatial` for `.h5ad` (raw + preprocessed) + missing path,
+  `from_adata`/`run_leiden` (skips already-annotated), `add_module_expression`,
+  `spatial_hm` (two PNG versions), `sort_columns_by_leiden` grouping,
+  `plot_spatial_modules`/`plot_spatial_expression`, `module_color_map` consistency,
+  `assign_spots_to_modules` argmax + cutoff, coordinate parsing, `select_hvgs`,
+  `spatial_module_scores` (mean/z-score).
 - `tests/fixtures.py` — the 6 CSV fixtures as raw strings + a `grid(name)`
   helper.
 
@@ -765,7 +779,7 @@ generating `promoter_fasta`.
 ### 3.7 Packaging & infra
 
 - **`pyproject.toml`** — setuptools build, extras `sc`/`app`/`agent`/`excel`/
-  `spatial` (h5py)/`all`/`dev`, console scripts `clusmap-config` (= `config:_cli`)
+  `spatial` (h5py + scanpy + leidenalg)/`all`/`dev`, console scripts `clusmap-config` (= `config:_cli`)
   and `clusmap-agent` (= `agent.runner:main`). New submodules must be added to
   `[tool.setuptools] packages`.
 - **`Dockerfile`** — python:3.11-slim + MEME-suite (compiled) + bedtools +
@@ -791,9 +805,10 @@ generating `promoter_fasta`.
 | Add a cell-type annotation method | [clusmap/annotate.py](clusmap/annotate.py) |
 | Add a GO library/organism rule | [clusmap/annotate.py](clusmap/annotate.py) → `mod_GO` |
 | Add a module-level analysis | [clusmap/analysis.py](clusmap/analysis.py) (mirror existing functions) |
-| Change spatial data import | [clusmap/spatial.py](clusmap/spatial.py) → `import_spatial`, `from_adata` |
-| Change spatial scoring / assignment | [clusmap/spatial.py](clusmap/spatial.py) → `spatial_module_scores`, `assign_spots_to_modules` |
-| Change spatial rendering | [clusmap/spatial.py](clusmap/spatial.py) → `plot_spatial_expression`, `plot_spatial_modules` |
+| Change spatial data import / preprocessing | [clusmap/spatial.py](clusmap/spatial.py) → `import_spatial`, `from_adata`, `run_leiden` |
+| Change spatial scoring / assignment | [clusmap/spatial.py](clusmap/spatial.py) → `spatial_module_scores`, `add_module_expression`, `assign_spots_to_modules` |
+| Change the two-version spatial heatmap | [clusmap/spatial.py](clusmap/spatial.py) → `spatial_hm`, `sort_columns_by_leiden` |
+| Change spatial rendering | [clusmap/spatial.py](clusmap/spatial.py) → `plot_spatial_modules`, `plot_spatial_expression` (sc.pl.spatial) |
 | Change the AME command / run modes | [clusmap/motif_run.py](clusmap/motif_run.py) → `_ame_cmd`, `run_ame` |
 | Change motif result filtering | [clusmap/motif.py](clusmap/motif.py) → `module_motif` |
 | Add a config key / CLI flag | [clusmap/config.py](clusmap/config.py) → `DEFAULTS`, `_cli` |

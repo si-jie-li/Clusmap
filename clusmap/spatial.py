@@ -1,40 +1,51 @@
-"""Spatial-transcriptomics support: treat a spot as a pseudo-bulk sample.
+"""Spatial-transcriptomics support (scanpy-centric, 10x Visium).
 
-This module lets you feed a 10x Visium dataset through the exact same clusmap
-engine (gene x spot instead of gene x sample): hierarchical clustering + dynamic
-tree cut to find gene modules, then annotate them as usual. The one genuinely
-new capability is *spatial* — rendering each module's expression profile across
-the tissue so you can map it back onto the H&E image.
+A spatial dataset is treated as pseudo-bulk: a spot is a sample, so the clusmap
+engine — gene modules via hierarchical clustering + dynamic tree cut, then the
+clusterheatmap / annotation / analysis steps — applies unchanged to the
+**gene x spot** matrix. The spatial part itself is scanpy-native:
 
-Two spatial views are provided:
+* ``import_spatial`` reads either a 10x Visium output *folder*
+  (``sc.read_visium``) or a pre-made ``.h5ad`` *file* (``sc.read_h5ad``) into an
+  AnnData and, when the data is raw (no ``leiden`` / ``log1p`` / HVG already
+  present), runs the standard scanpy pipeline
+  (normalize -> log1p -> HVG -> scale -> PCA -> neighbors -> Leiden) so that
+  ``adata.obs['leiden']`` holds **spot clusters** (a module formed by spots).
+* ``run_leiden`` is that pipeline, callable on any AnnData.
+* ``plot_spatial_modules`` renders the **Leiden** spot clusters over the H&E
+  image with ``sc.pl.spatial(adata, color='leiden', img_key='hires')``.
+* ``plot_spatial_expression`` renders the **mean expression of each gene
+  module** (a module formed by genes, from ``gen_mod``) across the tissue, one
+  subplot per module, again via ``sc.pl.spatial``.
+* ``spatial_hm`` draws the usual clusmap clusterheatmap in **two versions**
+  reusing :func:`clusmap.plot.bulk_hm`: v1 clusters rows *and* columns;
+  v2 groups columns by Leiden cluster (clustered within each group) with
+  ``col_cluster=False``. The Leiden annotation is the default column colour
+  band; pass ``col_cat`` to add more bands.
 
-* ``plot_spatial_expression`` — one subplot per module, each showing that
-  module's per-spot expression (mean of its genes, or the first-PC eigengene)
-  as a continuous colour scale, optionally overlaid on the H&E image. This is
-  the primary "where is this module active?" view.
-* ``plot_spatial_modules`` — a single figure colouring each spot by the module
-  it most strongly expresses (discrete, using the heatmap's module colours).
-
-Spot -> module is scored via ``spatial_module_scores`` (spots x modules) and
-assigned via ``assign_spots_to_modules``.
-
-Nothing here re-implements the engine: ``spatial_module_scores`` delegates to
-``analysis.module_eigengenes``, and the colors for the discrete view come from
-``plot.module_color_map`` so they match ``bulk_hm`` exactly.
+The spatial metadata (pixel coordinates, H&E image, scale factors) all lives in
+the AnnData (``obsm['spatial']`` + ``uns['spatial']``) so nothing is
+re-implemented — plots are plain ``sc.pl.spatial`` calls.
 """
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from scipy.sparse import csc_matrix, issparse
+from scipy.sparse import issparse
 
 from .state import ModuleState
+
+try:  # scanpy is an optional (spatial) dependency
+    import scanpy as sc
+    _HAVE_SCANPY = True
+except Exception:  # pragma: no cover - exercised only without the extra
+    sc = None
+    _HAVE_SCANPY = False
 
 
 # --------------------------------------------------------------------------- #
@@ -42,35 +53,54 @@ from .state import ModuleState
 # --------------------------------------------------------------------------- #
 @dataclass
 class SpatialDataset:
-    """A spatial dataset as gene x spot bulk data plus physical coordinates.
+    """A spatial dataset as an AnnData plus the clusmap gene x spot matrix.
 
     Attributes
     ----------
+    adata:
+        The (preprocessed) AnnData. ``obs['leiden']`` holds the spot clusters,
+        ``obsm['spatial']`` the pixel coordinates, ``uns['spatial']`` the H&E
+        images / scale factors. This is what the ``sc.pl.spatial`` plots and
+        the two-version heatmap read from.
     rna:
-        genes x spots expression matrix (columns = spot barcodes). Feeds straight
-        into ``preprocess`` / ``gen_mod`` / ``bulk_hm`` like any bulk matrix.
+        genes x spots expression matrix (log1p of the highly-variable genes;
+        columns = spot barcodes). Feeds straight into ``gen_mod`` / ``bulk_hm``
+        like any bulk matrix.
     coords:
-        index = spot barcode, columns ``x`` / ``y`` in full-resolution pixel
-        coordinates (as written by Space Ranger ``tissue_positions``).
+        index = spot barcode, columns ``x`` / ``y`` (pixel coordinates, taken
+        from ``adata.obsm['spatial']``). Provided for convenience.
     scale_factors:
         ``scalefactors_json.json`` contents (``tissue_lowres_scalef``,
         ``tissue_hires_scalef``, ``spot_diameter_fullres``, ...).
     image:
-        path to ``tissue_lowres_image.png`` (or an image array from AnnData),
-        used as the H&E backdrop. ``None`` disables the overlay.
+        lowres H&E image array from ``uns['spatial']`` (or ``None``).
     image_hires:
-        path to ``tissue_hires_image.png`` (full resolution) if present.
+        hires H&E image array from ``uns['spatial']`` (or ``None``).
     """
+
+    adata: Any
     rna: pd.DataFrame
     coords: pd.DataFrame
     scale_factors: Dict[str, float]
-    image: Optional[Union[str, np.ndarray]] = None
-    image_hires: Optional[Union[str, np.ndarray]] = None
+    image: Optional[np.ndarray] = None
+    image_hires: Optional[np.ndarray] = None
+
+    @property
+    def leiden(self) -> pd.Series:
+        """Spot -> Leiden cluster (a module formed by spots)."""
+        return self.adata.obs["leiden"].astype(str)
 
 
 # --------------------------------------------------------------------------- #
 # small helpers
 # --------------------------------------------------------------------------- #
+def _require_scanpy():
+    if not _HAVE_SCANPY:
+        raise ImportError(
+            "scanpy is required for spatial support. Install it with: "
+            "pip install 'clusmap[spatial]'")
+
+
 def _make_unique(names) -> list:
     """De-duplicate gene names in place (``X``, ``X_1``, ``X_2``, ...)."""
     seen, out = set(), []
@@ -84,6 +114,13 @@ def _make_unique(names) -> list:
     return out
 
 
+def _as_int(x) -> int:
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _first(cols, candidates) -> Optional[str]:
     for c in candidates:
         if c in cols:
@@ -91,51 +128,12 @@ def _first(cols, candidates) -> Optional[str]:
     return None
 
 
-def _decode(v) -> str:
-    return v.decode() if isinstance(v, bytes) else str(v)
-
-
-# --------------------------------------------------------------------------- #
-# 10x matrix readers
-# --------------------------------------------------------------------------- #
-def _read_10x_h5(path: str):
-    """Read ``filtered_feature_bc_matrix.h5`` -> (csc X, genes, barcodes)."""
-    import h5py
-    with h5py.File(path, "r") as f:
-        m = f["matrix"]
-        shape = tuple(int(x) for x in m["shape"][:])          # (features, barcodes)
-        X = csc_matrix((m["data"][:], m["indices"][:], m["indptr"][:]),
-                       shape=shape)
-        genes = [_decode(n) for n in m["features"]["name"][:]]
-        barcodes = [_decode(b) for b in m["barcodes"][:]]
-    return X, genes, barcodes
-
-
-def _read_10x_mtx(path: str):
-    """Read a ``filtered_feature_bc_matrix/`` mtx dir -> (csc X, genes, barcodes)."""
-    import gzip
-    from scipy.io import mmread
-
-    def _col(p, i):
-        with gzip.open(p, "rt") as fh:
-            return [ln.rstrip("\n").split("\t")[i] for ln in fh]
-
-    X = mmread(os.path.join(path, "matrix.mtx.gz"))
-    if not issparse(X):
-        X = csc_matrix(X)
-    genes = _col(os.path.join(path, "features.tsv.gz"), 1)
-    barcodes = _col(os.path.join(path, "barcodes.tsv.gz"), 0)
-    return X, genes, barcodes
-
-
-# --------------------------------------------------------------------------- #
-# coordinate / scale-factor readers
-# --------------------------------------------------------------------------- #
 def _read_coords(path: str) -> pd.DataFrame:
     """Parse ``tissue_positions[_list].csv`` -> DataFrame (index=barcode, x, y).
 
     Handles both the 6-column no-header ``_list`` variant and the header'd
-    ``tissue_positions.csv``; only ``in_tissue == 1`` spots are kept.
+    ``tissue_positions.csv``; only ``in_tissue == 1`` spots are kept. Mainly
+    useful for inspecting a Space Ranger output directory directly.
     """
     raw = pd.read_csv(path, header=None)
     first = str(raw.iloc[0, 0]).strip().lower()
@@ -161,98 +159,138 @@ def _read_coords(path: str) -> pd.DataFrame:
     return coords
 
 
-def _read_scalefactors(path: Union[str, Path]) -> Dict[str, float]:
-    p = Path(path)
-    if not p.exists():
-        return {}
-    with open(p) as fh:
-        return json.load(fh)
+def _library_id(adata) -> Optional[str]:
+    """Return the first Visium library id in ``uns['spatial']`` (or ``None``)."""
+    spatial = adata.uns.get("spatial", {}) or {}
+    if not spatial:
+        return None
+    first = next(iter(spatial))
+    if isinstance(spatial[first], dict) and (
+            "images" in spatial[first] or "scalefactors" in spatial[first]):
+        return first          # nested per-library layout
+    return None               # already the single-library layout
 
 
-def _first_library(uns_spatial: dict) -> Optional[dict]:
-    if "scalefactors" in uns_spatial or "images" in uns_spatial:
-        return uns_spatial
-    for v in uns_spatial.values():
-        if isinstance(v, dict) and ("scalefactors" in v or "images" in v):
-            return v
-    return None
+def _has_images(adata) -> bool:
+    lib = _library_id(adata)
+    if lib is None:
+        spatial = adata.uns.get("spatial", {}) or {}
+        return bool(spatial.get("images"))
+    return bool((adata.uns["spatial"][lib] or {}).get("images"))
+
+
+def _rna_from_adata(adata: Any) -> pd.DataFrame:
+    """log1p gene x spot DataFrame from an AnnData (HVG subset when marked)."""
+    _require_scanpy()
+    adata = adata.copy()
+    adata.var_names_make_unique()
+    hvg = adata.var.get("highly_variable")
+    if hvg is not None and bool(hvg.any()):
+        adata = adata[:, hvg]
+    X = adata.X
+    X = X.toarray() if issparse(X) else np.asarray(X)
+    return pd.DataFrame(X.T, index=list(adata.var_names),
+                        columns=list(adata.obs_names)).astype(float)
+
+
+# --------------------------------------------------------------------------- #
+# preprocessing + Leiden (spot clusters)
+# --------------------------------------------------------------------------- #
+def run_leiden(adata, *, n_top_genes: int = 2000, resolution: float = 0.5,
+               random_state: int = 0, n_neighbors: int = 10,
+               n_pcs: int = 40) -> Any:
+    """Run the standard scanpy pipeline, adding ``obs['leiden']`` to *adata*.
+
+    If the data is already preprocessed (``log1p`` in ``uns``), the
+    normalization steps are skipped; if ``highly_variable`` is already in
+    ``var``, the existing HVG mask is respected; if ``leiden`` is already in
+    ``obs`` the data is returned untouched. Returns the same AnnData (a copy),
+    with ``obs['leiden']`` holding the spot clusters.
+    """
+    _require_scanpy()
+    if "leiden" in adata.obs:
+        return adata
+    adata = adata.copy()
+    adata.var_names_make_unique()
+
+    if "log1p" not in adata.uns:
+        sc.pp.normalize_total(adata, target_sum=1e4)
+        sc.pp.log1p(adata)
+
+    if "highly_variable" not in adata.var:
+        if n_top_genes is None or n_top_genes >= adata.n_vars:
+            adata.var["highly_variable"] = True
+        else:
+            sc.pp.highly_variable_genes(adata, flavor="seurat",
+                                        n_top_genes=n_top_genes)
+
+    hvg = adata[:, adata.var["highly_variable"].values].copy()
+    sc.pp.scale(hvg, max_value=10)
+    n_comps = min(hvg.n_obs - 1, hvg.n_vars)
+    sc.tl.pca(hvg, svd_solver="arpack", n_comps=min(n_pcs, n_comps))
+    sc.pp.neighbors(hvg, n_neighbors=min(n_neighbors, hvg.n_obs - 1),
+                    n_pcs=min(n_pcs, n_comps))
+    sc.tl.leiden(hvg, resolution=resolution, random_state=random_state)
+    adata.obs["leiden"] = hvg.obs["leiden"]
+    return adata
 
 
 # --------------------------------------------------------------------------- #
 # importers
 # --------------------------------------------------------------------------- #
-def import_spatial(path, *, counts_file=None, coords_file=None,
-                   image: str = "lowres") -> SpatialDataset:
-    """Load a 10x Visium output directory into a :class:`SpatialDataset`.
+def import_spatial(path, *, n_top_genes: int = 2000, resolution: float = 0.5,
+                   random_state: int = 0) -> SpatialDataset:
+    """Load spatial data from a Visium folder or an ``.h5ad`` file.
 
-    Expects the Space Ranger layout under ``path``::
+    Robust to both input formats:
 
-        path/
-          filtered_feature_bc_matrix.h5      (or filtered_feature_bc_matrix/ mtx)
-          spatial/tissue_positions_list.csv  (or tissue_positions.csv)
-          spatial/scalefactors_json.json
-          spatial/tissue_lowres_image.png    (or tissue_hires_image.png)
+    * a **10x Visium output folder** (``sc.read_visium``) — e.g.
+      ``"V1_Mouse_Brain_Sagittal_Posterior"`` (must contain
+      ``filtered_feature_bc_matrix.h5`` + a ``spatial/`` directory);
+    * a **pre-made ``.h5ad`` file** (``sc.read_h5ad``) — a Visium AnnData with
+      ``obsm['spatial']`` / ``uns['spatial']`` (e.g. produced by
+      ``sc.datasets.visium_sge`` and saved, or a custom dataset).
 
-    ``image`` selects the H&E backdrop ("lowres" default, "hires", or ``None``
-    to disable). ``counts_file`` / ``coords_file`` override auto-detection.
+    If the input carries no preprocessed information (no ``leiden``), the
+    scanpy pipeline (``run_leiden``) is run exactly as for raw data, so the
+    returned dataset always has ``adata.obs['leiden']``.
+
+    Returns a :class:`SpatialDataset` (``adata`` + the ``rna`` gene x spot
+    matrix for the clusmap engine).
     """
+    _require_scanpy()
     path = Path(path)
-
-    # expression matrix -> genes x spots (dense)
-    if counts_file is None:
-        h5 = path / "filtered_feature_bc_matrix.h5"
-        mtx = path / "filtered_feature_bc_matrix"
-        if h5.exists():
-            X, genes, spots = _read_10x_h5(str(h5))
-        elif mtx.is_dir():
-            X, genes, spots = _read_10x_mtx(str(mtx))
-        else:
-            raise FileNotFoundError(
-                f"No 10x matrix under {path} (expected filtered_feature_bc_matrix.h5 "
-                "or filtered_feature_bc_matrix/).")
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Spatial data not found: {path}\nPass either a 10x Visium output "
+            "folder or a .h5ad file.")
+    if path.name.lower().endswith((".h5ad", ".h5ad.gz")):
+        adata = sc.read_h5ad(str(path))
+    elif path.is_dir():
+        adata = sc.read_visium(str(path))
     else:
-        cf = Path(counts_file)
-        X, genes, spots = _read_10x_mtx(str(cf)) if cf.is_dir() else _read_10x_h5(str(cf))
-
-    genes = _make_unique(genes)
-    rna = pd.DataFrame(X.toarray(), index=genes, columns=spots).astype(float)
-
-    # coordinates (keep only spots present in the matrix)
-    if coords_file is None:
-        coords_file = path / "spatial" / "tissue_positions_list.csv"
-        if not coords_file.exists():
-            coords_file = path / "spatial" / "tissue_positions.csv"
-    coords = _read_coords(str(coords_file))
-    keep = [s for s in spots if s in coords.index]
-    coords = coords.loc[keep]
-    rna = rna.loc[:, keep]
-
-    # scale factors + images
-    scale_factors = _read_scalefactors(path / "spatial" / "scalefactors_json.json")
-    lowres = path / "spatial" / "tissue_lowres_image.png"
-    hires = path / "spatial" / "tissue_hires_image.png"
-    image_path = None
-    if image in ("lowres", "hires"):
-        chosen = lowres if image == "lowres" else hires
-        if chosen.exists():
-            image_path = str(chosen)
-    return SpatialDataset(rna=rna, coords=coords, scale_factors=scale_factors,
-                          image=image_path,
-                          image_hires=str(hires) if hires.exists() else None)
+        raise ValueError(
+            f"Unrecognized spatial input {path}: pass a Visium output folder "
+            "(a directory) or a .h5ad file (a 10x filtered_feature_bc_matrix.h5 "
+            "belongs to a folder, not a standalone .h5ad).")
+    return from_adata(adata, n_top_genes=n_top_genes, resolution=resolution,
+                      random_state=random_state)
 
 
-def from_adata(adata, *, image: str = "lowres") -> SpatialDataset:
-    """Convert a scanpy ``read_visium`` AnnData into a :class:`SpatialDataset`.
+def from_adata(adata, *, n_top_genes: int = 2000, resolution: float = 0.5,
+               random_state: int = 0) -> SpatialDataset:
+    """Convert any (Visium) AnnData into a :class:`SpatialDataset`.
 
-    Uses ``adata.obsm["spatial"]`` for pixel coordinates and ``adata.uns`` for
-    scale factors / images, so users who already load data with scanpy
-    (e.g. ``sc.datasets.visium_sge(...)``) can hand off without re-parsing files.
+    Ensures preprocessing + Leiden (via :func:`run_leiden`) unless the data is
+    already annotated, then builds the ``rna`` gene x spot matrix and the
+    convenience ``coords`` / scale-factor fields.
     """
-    genes = _make_unique([str(g) for g in adata.var_names])
-    spots = [str(b) for b in adata.obs_names]
-    X = adata.X.toarray() if issparse(adata.X) else np.asarray(adata.X)
-    rna = pd.DataFrame(X.T, index=genes, columns=spots).astype(float)
+    _require_scanpy()
+    adata = run_leiden(adata, n_top_genes=n_top_genes, resolution=resolution,
+                       random_state=random_state)
+    rna = _rna_from_adata(adata)
 
+    spots = [str(b) for b in adata.obs_names]
     if "spatial" in adata.obsm:
         arr = np.asarray(adata.obsm["spatial"])
         coords = pd.DataFrame({"x": arr[:, 0], "y": arr[:, 1]}, index=spots)
@@ -263,30 +301,34 @@ def from_adata(adata, *, image: str = "lowres") -> SpatialDataset:
     scale_factors: Dict[str, float] = {}
     img: Optional[np.ndarray] = None
     img_hires: Optional[np.ndarray] = None
-    lib = _first_library(adata.uns.get("spatial", {}))
-    if lib:
-        scale_factors = dict(lib.get("scalefactors", {}) or {})
-        images = lib.get("images", {}) or {}
-        if image in ("lowres", "hires") and image in images:
-            img = images[image]
+    lib = _library_id(adata)
+    if lib is not None:
+        entry = adata.uns["spatial"][lib]
+    else:
+        entry = adata.uns.get("spatial", {})
+    if entry:
+        scale_factors = dict(entry.get("scalefactors", {}) or {})
+        images = entry.get("images", {}) or {}
+        if "lowres" in images:
+            img = np.asarray(images["lowres"])
         if "hires" in images:
-            img_hires = images["hires"]
-    return SpatialDataset(rna=rna, coords=coords, scale_factors=scale_factors,
-                          image=img, image_hires=img_hires)
+            img_hires = np.asarray(images["hires"])
+    return SpatialDataset(adata=adata, rna=rna, coords=coords,
+                          scale_factors=scale_factors, image=img,
+                          image_hires=img_hires)
 
 
 # --------------------------------------------------------------------------- #
-# feature selection
+# feature selection (pure-pandas fallback / convenience)
 # --------------------------------------------------------------------------- #
 def select_hvgs(rna: pd.DataFrame, *, n_top: int = 2000,
                 flavor: str = "dispersion") -> pd.DataFrame:
     """Subset to the top ``n_top`` highly-variable genes (genes x spots).
 
-    A simple, pure-pandas heuristic so clustering the full 30k-gene spatial
-    matrix stays tractable (``pdist`` is O(n^2) in genes). ``flavor``:
+    A simple, pure-pandas heuristic so clustering a large matrix stays
+    tractable (``pdist`` is O(n^2) in genes). ``flavor``:
 
-    * ``"dispersion"`` (default) — variance-to-mean ratio of the raw counts
-      (index of dispersion), suited to unfiltered count matrices.
+    * ``"dispersion"`` (default) — variance-to-mean ratio of the raw counts.
     * ``"variance"`` — plain per-gene variance.
 
     Returns ``n_top`` or fewer rows; pass ``n_top=None`` to return unchanged.
@@ -306,7 +348,7 @@ def select_hvgs(rna: pd.DataFrame, *, n_top: int = 2000,
 
 
 # --------------------------------------------------------------------------- #
-# module scores / assignment
+# module scores / assignment (gene modules on the rna matrix)
 # --------------------------------------------------------------------------- #
 def _norm_scores(scores: pd.DataFrame, norm: Optional[str]) -> pd.DataFrame:
     if norm in (None, "none"):
@@ -323,18 +365,18 @@ def _norm_scores(scores: pd.DataFrame, norm: Optional[str]) -> pd.DataFrame:
 def spatial_module_scores(rna: pd.DataFrame, state: ModuleState, *,
                           method: str = "mean",
                           norm: Optional[str] = "zscore") -> pd.DataFrame:
-    """Per-spot expression of each gene module (spots x modules).
+    """Per-spot expression of each *gene* module (spots x modules).
 
     ``method``:
 
     * ``"mean"`` (default) — mean expression of the module's genes at each spot
-      (a direct "spatial expression profile" of the module).
+      (the "spatial expression profile" of the gene module).
     * ``"eigengene"`` — the module's first-PC eigengene (delegates to
-      :func:`analysis.module_eigengenes`), a WGCNA-style representative profile.
+      :func:`clusmap.analysis.module_eigengenes`), a WGCNA-style profile.
 
     ``norm`` z-scores (default) or min-max scales each module across spots so
-    modules are comparable on one colour scale; ``None`` returns raw values.
-    Columns are 1-based heatmap module ids, matching ``state`` / the heatmap.
+    modules are comparable; ``None`` returns raw values. Columns are 1-based
+    heatmap module ids, matching ``state`` / the heatmap.
     """
     from .analysis import module_eigengenes
 
@@ -359,7 +401,7 @@ def spatial_module_scores(rna: pd.DataFrame, state: ModuleState, *,
 
 def assign_spots_to_modules(scores: pd.DataFrame, *,
                             min_score: Optional[float] = None) -> pd.Series:
-    """Assign each spot to its highest-scoring module (Series: spot -> module id).
+    """Assign each spot to its highest-scoring *gene* module (spot -> module id).
 
     ``min_score`` (optional) thresholds on the best score; spots below it become
     0 (unassigned / mixed). ``None`` always assigns the argmax module.
@@ -371,168 +413,196 @@ def assign_spots_to_modules(scores: pd.DataFrame, *,
     return assign
 
 
-# --------------------------------------------------------------------------- #
-# plotting helpers
-# --------------------------------------------------------------------------- #
-def _load_image(image):
-    from matplotlib import image as mpimg
-    if isinstance(image, (str, os.PathLike)):
-        return mpimg.imread(str(image))
-    return np.asarray(image)
+def add_module_expression(adata, rna_df, state, *, method: str = "mean",
+                          norm: Optional[str] = "zscore") -> pd.DataFrame:
+    """Add per-gene-module expression to ``adata.obs`` and return the scores.
 
-
-def _image_scalef(image, scale_factors) -> float:
-    """Pick the coordinate->image scale factor from the image identity.
-
-    Lowres images are downsampled by ``tissue_lowres_scalef``; hires images are
-    full-resolution (scale 1). Array images without a filename are assumed
-    lowres (the ``from_adata(image="lowres")`` default).
+    Adds one ``obs['module_{id}_expr']`` column per gene module (z-scored by
+    default so modules are comparable) — the columns that
+    :func:`plot_spatial_expression` renders with ``sc.pl.spatial``. The scores
+    DataFrame (spots x modules) is also returned.
     """
-    name = str(image) if isinstance(image, (str, os.PathLike)) else ""
-    if "hires" in name:
-        return 1.0
-    return (scale_factors or {}).get("tissue_lowres_scalef", 1.0)
-
-
-def _prepare_coords(coords: pd.DataFrame, image, scale_factors):
-    """Return (px, py, overlay) display coordinates for a spatial scatter."""
-    x = coords["x"].astype(float).values
-    y = coords["y"].astype(float).values
-    if image is None:
-        return x, y, False
-    sf = _image_scalef(image, scale_factors)
-    return x / sf, y / sf, True
-
-
-def _draw_spatial_base(ax, coords, image, scale_factors, spot_size):
-    """Draw the H&E backdrop (if any) + axis limits; return (px, py, spot_size)."""
-    px, py, overlay = _prepare_coords(coords, image, scale_factors)
-    if overlay:
-        arr = _load_image(image)
-        h, w = arr.shape[:2]
-        ax.imshow(arr, aspect="equal")
-        ax.set_xlim(0, w)
-        ax.set_ylim(h, 0)                       # top-left origin, like the image
-        if spot_size is None:
-            sf = _image_scalef(image, scale_factors)
-            diam = (scale_factors or {}).get("spot_diameter_fullres", 89.5) * sf
-            spot_size = max(1.0, diam ** 2)
-    else:
-        ax.invert_yaxis()                        # image convention (y down)
-        spot_size = 6.0 if spot_size is None else spot_size
-    return px, py, spot_size
+    scores = spatial_module_scores(rna_df, state, method=method, norm=norm)
+    for m in scores.columns:
+        adata.obs[f"module_{int(m)}_expr"] = scores[int(m)].reindex(
+            adata.obs_names).values.astype(float)
+    return scores
 
 
 # --------------------------------------------------------------------------- #
-# plotting: discrete module membership
+# plotting: sc.pl.spatial over the H&E image
 # --------------------------------------------------------------------------- #
-def plot_spatial_modules(coords, assignment, *, state=None, palette="hsv",
-                         color_map=None, image=None, scale_factors=None,
-                         spot_size=None, title=None, legend=True, ax=None,
-                         outdir=None, save_format="png", dpi=300):
-    """Colour each spot by the module it most strongly expresses.
+def _spatial_fig(adata, color, *, img_key="hires", library_id=None,
+                 ncols=1, title=None, **kwargs):
+    _require_scanpy()
+    if "spatial" not in adata.obsm:
+        raise ValueError(
+            "adata.obsm['spatial'] is missing — this AnnData has no Visium "
+            "spatial coordinates; sc.pl.spatial cannot draw it.")
+    if not _has_images(adata):
+        print("[spatial] no H&E images found in adata.uns['spatial'] — "
+              "sc.pl.spatial will still draw the tissue coordinates.")
+    lib = library_id or _library_id(adata)
+    return sc.pl.spatial(adata, color=color, img_key=img_key, library_id=lib,
+                         ncols=ncols, title=title, show=False,
+                         return_fig=True, **kwargs)
 
-    ``assignment`` is a spot -> module Series (see ``assign_spots_to_modules``).
-    Colours come from ``color_map`` or, if omitted, ``module_color_map(state)``
-    so they match the heatmap exactly (0 / unassigned -> white). Pass ``image`` +
-    ``scale_factors`` to overlay the H&E image.
+
+def plot_spatial_modules(adata, *, img_key: str = "hires", library_id=None,
+                         title: Optional[str] = None, outdir: Optional[str] = ".",
+                         save_format: str = "png", dpi: int = 150,
+                         **kwargs):
+    """Plot the **Leiden** spot clusters over the H&E image.
+
+    Uses ``sc.pl.spatial(adata, color='leiden', img_key='hires')`` — a module
+    formed *by spots*. Saves ``spatial_modules.<fmt>`` when ``outdir`` is given
+    and returns the matplotlib ``Figure``.
     """
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
-
-    if color_map is None:
-        if state is None:
-            raise ValueError("Pass either color_map or state (for module colors).")
-        from .plot import module_color_map
-        color_map = module_color_map(state, palette)
-
-    common = coords.index.intersection(assignment.index)
-    coords = coords.loc[common]
-    assignment = assignment.loc[common]
-
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(8, 8))
-    else:
-        fig = ax.get_figure()
-
-    px, py, s = _draw_spatial_base(ax, coords, image, scale_factors, spot_size)
-    mods = assignment.values.astype(int)
-    colors = [color_map.get(m, "#ffffff") for m in mods]
-    ax.scatter(px, py, c=colors, s=s, marker="o", linewidths=0, alpha=0.9)
-
-    if legend:
-        present = [m for m in sorted(set(mods)) if m != 0]
-        if 0 in set(mods):
-            present.append(0)
-        handles = [Patch(facecolor=color_map.get(m, "#ffffff"),
-                         label=("unassigned" if m == 0 else f"module {m}"))
-                   for m in present]
-        ax.legend(handles=handles, title="Modules", bbox_to_anchor=(1.02, 1),
-                  loc="upper left", frameon=False, fontsize=8)
-    ax.set_title(title if title is not None
-                 else f"Spatial modules ({len(set(mods) - {0})} modules)")
-    ax.set_xticks([])
-    ax.set_yticks([])
-
+    _require_scanpy()
+    if "leiden" not in adata.obs:
+        raise ValueError(
+            "adata.obs['leiden'] is missing — run import_spatial / run_leiden "
+            "first (or pass an already-annotated AnnData).")
+    if title is None:
+        title = f"Leiden clusters (n = {adata.obs['leiden'].nunique()})"
+    fig = _spatial_fig(adata, "leiden", img_key=img_key,
+                       library_id=library_id, title=title, **kwargs)
     if outdir is not None:
         os.makedirs(outdir, exist_ok=True)
         fname = f"spatial_modules.{save_format.lower()}"
         fig.savefig(os.path.join(outdir, fname), dpi=dpi, bbox_inches="tight")
-        print(f"Spatial module map saved to {os.path.join(outdir, fname)}")
-    return fig, ax
+        print(f"Leiden spatial map saved to {os.path.join(outdir, fname)}")
+    return fig
 
 
-# --------------------------------------------------------------------------- #
-# plotting: per-module expression grid
-# --------------------------------------------------------------------------- #
-def plot_spatial_expression(scores, coords, *, image=None, scale_factors=None,
-                            ncols=3, cmap="viridis", spot_size=None,
-                            vmin=None, vmax=None, colorbar=True, title=None,
-                            figsize=None, outdir=None, save_format="png",
-                            dpi=150):
-    """One subplot per module showing its spatial expression profile.
+def plot_spatial_expression(adata, *, modules: Optional[List[int]] = None,
+                            ncols: int = 3, img_key: str = "hires",
+                            library_id=None, outdir: Optional[str] = ".",
+                            save_format: str = "png", dpi: int = 150,
+                            **kwargs):
+    """Plot the **mean expression profile of each gene module** over the tissue.
 
-    ``scores`` is the spots x modules table from ``spatial_module_scores``; each
-    subplot scatters the spots, coloured by that module's score, over the
-    optional H&E image. ``vmin``/``vmax`` set a shared colour scale (defaults to
-    the global min/max so modules are directly comparable). Returns ``(fig, axes)``.
+    One subplot per gene module (a module formed *by genes*, from ``gen_mod``),
+    coloured by the module's mean per-spot expression
+    (``obs['module_{id}_expr']`` from :func:`add_module_expression`). Saves
+    ``spatial_module_expression.<fmt>`` when ``outdir`` is given and returns
+    the matplotlib ``Figure``.
     """
-    import matplotlib.pyplot as plt
-
-    modules = list(scores.columns)
-    n = len(modules)
-    ncols = max(1, min(ncols, n))
-    nrows = int(np.ceil(n / ncols))
-    if figsize is None:
-        figsize = (ncols * 3.4, nrows * 3.4)
-    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
-
-    if vmin is None:
-        vmin = float(scores.min().min())
-    if vmax is None:
-        vmax = float(scores.max().max())
-
-    sc = None
-    for i, m in enumerate(modules):
-        ax = axes.flat[i]
-        px, py, s = _draw_spatial_base(ax, coords, image, scale_factors, spot_size)
-        sc = ax.scatter(px, py, c=scores[m].values.astype(float), cmap=cmap,
-                        s=s, marker="o", linewidths=0, vmin=vmin, vmax=vmax)
-        ax.set_title(f"Module {m}")
-        ax.set_xticks([])
-        ax.set_yticks([])
-
-    for j in range(n, nrows * ncols):
-        axes.flat[j].set_visible(False)
-
-    if colorbar and sc is not None:
-        fig.colorbar(sc, ax=axes.ravel().tolist(), shrink=0.8,
-                     label="module expression (z-score)")
-    fig.suptitle(title or "Spatial expression of gene modules", fontsize=13)
-
+    _require_scanpy()
+    cols = [c for c in adata.obs.columns
+            if c.startswith("module_") and c.endswith("_expr")]
+    if not cols:
+        raise ValueError(
+            "No 'module_*_expr' columns in adata.obs — run "
+            "add_module_expression(adata, rna, state) first.")
+    if modules is not None:
+        cols = [f"module_{int(m)}_expr" for m in modules]
+        missing = [c for c in cols if c not in adata.obs]
+        if missing:
+            raise ValueError(f"Missing module-expression columns: {missing}")
+    ids = [int(c.split("_")[1]) for c in cols]
+    titles = [f"Module {m}" for m in ids]
+    fig = _spatial_fig(adata, cols, img_key=img_key, library_id=library_id,
+                       ncols=ncols, title=titles, **kwargs)
     if outdir is not None:
         os.makedirs(outdir, exist_ok=True)
         fname = f"spatial_module_expression.{save_format.lower()}"
         fig.savefig(os.path.join(outdir, fname), dpi=dpi, bbox_inches="tight")
         print(f"Spatial module expression saved to {os.path.join(outdir, fname)}")
-    return fig, axes
+    return fig
+
+
+# --------------------------------------------------------------------------- #
+# two-version clusterheatmap (reuses bulk_hm)
+# --------------------------------------------------------------------------- #
+def sort_columns_by_leiden(rna_df: pd.DataFrame, leiden,
+                           *, within_cluster: bool = True,
+                           metric: str = "correlation",
+                           method: str = "average"):
+    """Order ``rna_df`` columns by Leiden group, clustered within each group.
+
+    Returns ``(rna_df_sorted, leiden_sorted)``: the same genes, with the spot
+    columns rearranged so that spots of one Leiden cluster sit together. When
+    ``within_cluster`` (default), columns inside a group are re-ordered by their
+    own correlation dendrogram, so each group still shows internal structure.
+    """
+    from scipy.cluster.hierarchy import leaves_list, linkage
+    from scipy.spatial.distance import pdist
+
+    leiden = pd.Series(leiden).reindex(rna_df.columns)
+    groups = sorted({c for c in leiden.dropna().unique()}, key=_as_int)
+    order: List[Any] = []
+    for g in groups:
+        cols = [c for c in rna_df.columns if leiden.loc[c] == g]
+        if within_cluster and len(cols) > 1:
+            sub = rna_df[cols].astype(float)
+            d = np.nan_to_num(pdist(sub.T.values, metric=metric))
+            Z = linkage(d, method=method)
+            order.extend(cols[i] for i in leaves_list(Z))
+        else:
+            order.extend(cols)
+    return rna_df[order], leiden.reindex(order)
+
+
+def spatial_hm(adata, rna_df, state: ModuleState, *, leiden_col: str = "leiden",
+               versions=(1, 2),
+               col_cat: Optional[Dict[str, pd.Series]] = None,
+               col_color_manual: Optional[Dict[str, Dict[str, str]]] = None,
+               col_legend: Optional[list] = None,
+               hm_args: Optional[Dict[str, Any]] = None,
+               title: Optional[str] = None, mod_palette: str = "hsv",
+               col_palette: str = "tab20", save_format: str = "png",
+               outdir: Optional[str] = "."):
+    """Gene x spot clusterheatmap in two versions (reuses ``bulk_hm``).
+
+    The **Leiden** annotation is the default column colour band
+    (``col_cat={'leiden': ...}``); pass ``col_cat`` to add more bands
+    (e.g. a sample-level metadata Series, exactly like ``bulk_hm``).
+
+    * **v1** — rows and columns both clustered (``col_cluster=True``).
+    * **v2** — rows clustered, columns grouped by Leiden cluster and clustered
+      *within* each group (``col_cluster=False`` with pre-sorted columns).
+
+    Returns ``(hm_v1, hm_v2)`` (the seaborn ``ClusterGrid`` objects). When
+    ``outdir`` is given the figures are saved as ``spatial_heatmap_v1.<fmt>``
+    and ``spatial_heatmap_v2.<fmt>``.
+    """
+    from .plot import bulk_hm
+
+    if leiden_col not in adata.obs:
+        raise ValueError(
+            f"adata.obs[{leiden_col!r}] is missing — run import_spatial / "
+            "run_leiden first.")
+    leiden = adata.obs[leiden_col].astype(str).reindex(rna_df.columns)
+
+    col_cat = dict(col_cat or {})
+    col_cat.setdefault(leiden_col, leiden)
+    col_legend = [leiden_col] + list(col_legend or [])
+
+    hms: Dict[int, Any] = {}
+    if 1 in versions:
+        hms[1] = bulk_hm(rna_df, state, title=title, mod_palette=mod_palette,
+                         col_palette=col_palette, col_cat=col_cat,
+                         col_color_manual=col_color_manual,
+                         col_legend=col_legend, hm_args=dict(hm_args or {}),
+                         outdir=None)
+    if 2 in versions:
+        rna2, leiden2 = sort_columns_by_leiden(rna_df, leiden)
+        cc2 = dict(col_cat)
+        cc2[leiden_col] = leiden2
+        hm_args2 = dict(hm_args or {})
+        hm_args2["col_cluster"] = False
+        hms[2] = bulk_hm(rna2, state, title=title, mod_palette=mod_palette,
+                         col_palette=col_palette, col_cat=cc2,
+                         col_color_manual=col_color_manual,
+                         col_legend=col_legend, hm_args=hm_args2, outdir=None)
+
+    if outdir is not None:
+        os.makedirs(outdir, exist_ok=True)
+        for v, hm in hms.items():
+            dpi = getattr(hm, "_clusmap_dpi", 300)
+            fname = f"spatial_heatmap_v{v}.{save_format.lower()}"
+            kw = {"dpi": dpi} if save_format.lower() == "png" else {}
+            hm.savefig(os.path.join(outdir, fname), bbox_inches="tight", **kw)
+            print(f"Spatial heatmap v{v} saved to {os.path.join(outdir, fname)}")
+    return hms.get(1), hms.get(2)

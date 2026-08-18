@@ -19,8 +19,10 @@ The public API: `import_data`, `preprocess`, `extract_color_cat`, `gen_mod`,
 `bulk_hm`, `cluster_sample_stats`, `module_color_map`, `compute_pseudo_bulk`,
 `pseudo_bulk_hm`, `sc_marker_hm`, `celltype_selection`, `mod_GO`, `module_motif`,
 `run_pipeline_from_config`, `ModuleState`, plus the spatial API (§14):
-`import_spatial`, `from_adata`, `select_hvgs`, `spatial_module_scores`,
-`assign_spots_to_modules`, `plot_spatial_modules`, `plot_spatial_expression`.
+`import_spatial`, `from_adata`, `run_leiden`, `select_hvgs`,
+`spatial_module_scores`, `assign_spots_to_modules`, `add_module_expression`,
+`sort_columns_by_leiden`, `spatial_hm`, `plot_spatial_modules`,
+`plot_spatial_expression`.
 
 ---
 
@@ -379,87 +381,129 @@ Outputs: `module_eigengenes.tsv`, `hub_genes.tsv`, `module_trait_cor.tsv` +
 ## 14. Spatial transcriptomics (10x Visium)
 
 A spot is a pseudo-bulk sample, so spatial data runs through the exact same
-engine as bulk — `gene × sample` becomes `gene × spot`. Find gene modules with
-`gen_mod`, then map each module's expression back onto the tissue (over the H&E
-image) so you can relate modules to anatomy. Requires `pip install
-"clusmap[spatial]"` (adds `h5py`).
+engine as bulk — `gene × sample` becomes `gene × spot`. Two kinds of module
+coexist:
+
+- **spot modules** — the *Leiden* clusters of `import_spatial`'s scanpy
+  pipeline (a module **formed by spots**), used for the spatial cluster map;
+- **gene modules** — the usual `gen_mod` dynamic-tree-cut modules (a module
+  **formed by genes**), used for the heatmap and per-module expression plots.
+
+Everything is scanpy-native (`sc.pl.spatial` over the H&E image). Requires
+`pip install "clusmap[spatial]"` (adds `h5py`, `scanpy`, `leidenalg`).
+
+### Import (folder or `.h5ad`)
+
+`import_spatial` accepts **either** a 10x Visium output folder **or** a pre-made
+`.h5ad` file, and — if the data carries no preprocessing — runs the standard
+scanpy pipeline (normalize → log1p → HVG → scale → PCA → neighbors → Leiden) so
+the returned object always has `adata.obs['leiden']` (spot clusters):
 
 ```python
-sdata = cm.import_spatial("V1_Mouse_Brain_Sagittal_Posterior", image="lowres")
-sdata.rna                    # genes x spots (columns = spot barcodes)
-sdata.coords                 # barcode -> x, y (full-res pixels)
-sdata.scale_factors          # tissue_lowres_scalef, spot_diameter_fullres, ...
-sdata.image                  # path to tissue_lowres_image.png (H&E backdrop)
+sdata = cm.import_spatial("V1_Mouse_Brain_Sagittal_Posterior")  # folder
+sdata = cm.import_spatial("brain.h5ad")                         # .h5ad file
+sdata.adata                # scanpy AnnData: obs['leiden'], obsm['spatial'],
+                           #   uns['spatial'] (H&E images + scale factors)
+sdata.rna                  # genes x spots log1p-HVG matrix (for the clusmap engine)
+sdata.leiden               # spot -> Leiden cluster (Series)
+sdata.coords               # barcode -> x, y (pixels)
 ```
 
-`import_spatial` auto-detects `filtered_feature_bc_matrix.h5` (or the
-`filtered_feature_bc_matrix/` mtx dir), `spatial/tissue_positions[_list].csv`,
-`scalefactors_json.json`, and the H&E PNGs. Already loading via scanpy? Hand the
-AnnData straight in:
+Already loading via scanpy? Hand the AnnData straight in:
 
 ```python
 import scanpy as sc
 adata = sc.datasets.visium_sge("V1_Mouse_Brain_Sagittal_Posterior")
-sdata = cm.from_adata(adata, image="lowres")
+sdata = cm.from_adata(adata, n_top_genes=2000)
 ```
 
-### Cluster (optionally on top highly-variable genes)
+`n_top_genes` (default 2000) controls the highly-variable-gene subset;
+`resolution` (default 0.5) the Leiden resolution. A preprocessed `.h5ad` that
+already has `leiden` is used as-is (no re-preprocessing).
 
-The full 30k-gene matrix is heavy for `pdist` (O(n²)); subset to the top HVGs
-first, then preprocess and cluster exactly as for bulk:
+### Gene modules (module formed by genes)
+
+Cluster exactly as for bulk — `gen_mod` already receives the log1p HVG matrix
+from `import_spatial`:
 
 ```python
-rna   = cm.select_hvgs(sdata.rna, n_top=2000)   # flavor="dispersion" | "variance"
-rna   = cm.preprocess(rna)
-state = cm.gen_mod(rna, deepSplit=1, minClusterSize=30, outdir="spatial_out")
-cm.bulk_hm(rna, state, outdir="spatial_out")    # the same gene x spot clustermap
+state = cm.gen_mod(sdata.rna, deepSplit=1, minClusterSize=30, outdir="spatial_out")
 ```
 
-Every downstream step works unchanged — GO, cell-type swarm / pseudo-bulk,
-motif, eigengenes, hub genes, traits, preservation, report — because they only
-see a genes × spots frame.
+### Two-version clusterheatmap (reuses `bulk_hm`)
 
-### Show modules in space
+The heatmap output is kept for spatial data, in **two versions**, with the
+**Leiden** annotation as the default column colour band:
 
-Two views, both reusable and H&E-overlay-aware:
-
-**Per-module expression profile (the main one).** `spatial_module_scores` scores
-each spot × module (default `method="mean"` = mean of the module's genes, or
-`method="eigengene"` for the first-PC representative profile), z-scored per
-module so modules share one colour scale. `plot_spatial_expression` draws one
-subplot per module:
+- **v1** — rows *and* columns both clustered (`col_cluster=True`);
+- **v2** — rows clustered, columns grouped by Leiden cluster and clustered
+  *within* each group (`col_cluster=False` with pre-sorted columns).
 
 ```python
-scores = cm.spatial_module_scores(rna, state, method="mean", norm="zscore")
-cm.plot_spatial_expression(scores, sdata.coords, image=sdata.image,
-                           scale_factors=sdata.scale_factors,
-                           outdir="spatial_out")          # -> spatial_module_expression.png
+hm_v1, hm_v2 = cm.spatial_hm(sdata.adata, sdata.rna, state, outdir="spatial_out")
+# -> spatial_heatmap_v1.png, spatial_heatmap_v2.png
 ```
 
-**Discrete spot → module map.** Colour each spot by the module it most strongly
-expresses, using the heatmap's module colours (so the two figures agree):
+Add more column colour bars exactly like `bulk_hm`, e.g. a per-spot metadata
+Series: `cm.spatial_hm(..., col_cat={'leiden': ..., 'region': region_series})`.
+
+### Marker-celltype swarmplot (single-cell annotation)
+
+The bulk single-cell annotation steps work unchanged on the gene modules:
 
 ```python
-assign = cm.assign_spots_to_modules(scores)     # or min_score=0.5 to leave weak spots unassigned
-cm.plot_spatial_modules(sdata.coords, assign, state=state, image=sdata.image,
-                        scale_factors=sdata.scale_factors,
-                        outdir="spatial_out")    # -> spatial_modules.png
+selected = cm.celltype_selection(marker_path, "spatial_out/HM_ModGene.csv",
+                                 outdir="spatial_out")
+cm.sc_marker_hm(sdata.rna, hm_v1, marker_path, celltype=selected,
+                celltype_col="cell type", gene_col="official gene symbol",
+                outdir="spatial_out")          # -> heatmap_swarm.png
+```
+
+### Spatial plots (sc.pl.spatial over the H&E image)
+
+`spatial_module_scores` scores each spot × **gene module** (default
+`method="mean"` = mean of the module's genes, or `method="eigengene"`), z-scored
+per module so modules are comparable; `add_module_expression` drops those
+columns into `adata.obs` as `module_<id>_expr`:
+
+```python
+scores = cm.add_module_expression(sdata.adata, sdata.rna, state)  # -> spots x modules
+```
+
+**`spatial_modules.png`** — the **Leiden** spot clusters (module formed by
+spots):
+
+```python
+cm.plot_spatial_modules(sdata.adata, img_key="hires", outdir="spatial_out")
+```
+
+**`spatial_module_expression.png`** — one subplot per **gene module**, its mean
+per-spot expression across the tissue:
+
+```python
+cm.plot_spatial_expression(sdata.adata, img_key="hires", outdir="spatial_out")
+```
+
+Both are plain `sc.pl.spatial` calls, so you can colour the tissue yourself in a
+notebook:
+
+```python
+sc.pl.spatial(sdata.adata, color="leiden", img_key="hires")
+sc.pl.spatial(sdata.adata, color=["module_1_expr", "module_2_expr"], img_key="hires", ncols=4)
 ```
 
 ### Inspect one module interactively
 
-The grid figure shows every module at once. To zoom into a single module in an
-interactive viewer, export its genes and open them in **cellxgene**
-(https://cellxgene.cziscience.com) against the same Visium `.h5ad`:
+To zoom into a single gene module, export its genes and open them in
+**cellxgene** (https://cellxgene.cziscience.com) against the same Visium
+`.h5ad`:
 
 - get the module's gene list from `spatial_out/HM_ModGene.csv` (rows with
   `hm_mod == N`), e.g. `awk -F, '$1==3 {print $2}' spatial_out/HM_ModGene.csv`;
 - in cellxgene, add those genes to the colour-by panel — the spatial plot will
-  highlight where that module's genes are expressed;
-- or colour the spots yourself from the exported
-  `spatial_out/spatial_module_scores.tsv`.
+  highlight where that module's genes are expressed.
 
-Full end-to-end example: run `python demo_spatial.py [DATA_DIR]`.
+Full end-to-end example: run `python demo_spatial.py [DATA_DIR_OR_H5AD]`.
 
 ## 15. Packaging & publishing
 
@@ -474,7 +518,7 @@ twine upload dist/*              # publish to PyPI
 Console scripts installed: `clusmap-config` (path/HPC config) and
 `clusmap-agent` (chat agent). Optional extras keep the core lean:
 `sc` (single-cell), `app` (Streamlit/Plotly), `agent` (anthropic), `excel`,
-`spatial` (h5py).
+`spatial` (h5py + scanpy + leidenalg).
 
 To publish the tool:
 1. **PyPI** — `python -m build && twine upload dist/*`.
