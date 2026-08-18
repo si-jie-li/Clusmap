@@ -9,7 +9,9 @@ parsed without any extra parameters.
 from __future__ import annotations
 
 import os
-from typing import Optional
+import re
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -60,6 +62,244 @@ def _from_h5ad(file_path: str, layer: Optional[str] = None) -> pd.DataFrame:
     df = pd.DataFrame(np.asarray(X).T, index=adata.var_names.astype(str),
                       columns=adata.obs_names.astype(str))
     return df
+
+
+# --------------------------------------------------------------------------- #
+# Orientation / structure auto-detection for delimited text
+# --------------------------------------------------------------------------- #
+# Gene symbols that Excel/ pandas would wrongly coerce to a number (dates like
+# 1-Mar -> timestamp, or SEPT2/MARCH1 -> 2/1). We treat these as *non-numeric*
+# so the numeric-block detector never mistakes a gene-name column for data.
+_DATELIKE_GENE = re.compile(r"^\d{1,2}[-/][A-Za-z]{3}$")
+_NUMFAKE_GENE = re.compile(
+    r"^(SEPT|MARCH|DEC|FEB|OCT|NOV|JUN|JUL|AUG|APR)\d+$", re.IGNORECASE)
+
+
+@dataclass
+class TableStructure:
+    """What auto-detection inferred about a messy delimited table.
+
+    All indices are into the raw (header=None) string grid. ``transposed``
+    means the raw numeric block was samples×genes and was flipped to
+    genes×samples. ``confidence`` is ``high``/``medium``/``low``.
+    """
+    data_top: int
+    data_bottom: int
+    data_left: int
+    data_right: int
+    header_row: int = -1          # row holding sample names (``-1`` = none found)
+    gene_col: int = -1            # column holding gene names (``-1`` = none)
+    transposed: bool = False
+    confidence: str = "high"
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def n_genes(self) -> int:
+        return self.data_bottom - self.data_top + 1
+
+    @property
+    def n_samples(self) -> int:
+        return self.data_right - self.data_left + 1
+
+
+def _is_number_cell(value: str) -> bool:
+    """True if ``value`` reads as a number and is NOT a date-faked gene name."""
+    s = str(value).strip()
+    if not s or s.lower() in ("nan", "na", "null", "none", "."):
+        return False
+    if _DATELIKE_GENE.match(s) or _NUMFAKE_GENE.match(s):
+        return False
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _numeric_mask(raw: pd.DataFrame) -> np.ndarray:
+    """Boolean mask (R×C) of which cells in the string grid are numeric."""
+    return np.vectorize(_is_number_cell)(raw.values.astype(str))
+
+
+def _find_dense_block(mask: np.ndarray) -> Tuple[int, int, int, int]:
+    """Locate the largest contiguous numeric rectangle in the boolean mask.
+
+    Returns ``(top, bottom, left, right)`` inclusive. Strategy: for every pair
+    of rows, find columns that are numeric across the whole band, then keep the
+    band×columnspan with the best score (density × area). O(R²·C) but the
+    published-figure files this targets are small (thousands of cells).
+    """
+    nrows, ncols = mask.shape
+    best = (0, 0, 0, 0, -1)   # top, bottom, left, right, score
+    # prefix sums per column for fast "all numeric in this band" queries
+    cum = np.zeros((nrows + 1, ncols), dtype=int)
+    cum[1:] = mask.astype(int)
+    np.cumsum(cum, axis=0, out=cum)
+    for top in range(nrows):
+        for bottom in range(top, nrows):
+            band = bottom - top + 1
+            # columns numeric across the entire band
+            col_count = cum[bottom + 1] - cum[top]
+            full = (col_count == band)
+            # longest contiguous run of such columns
+            run_best = run_left = run_right = 0
+            run_start = -1
+            for c in range(ncols):
+                if full[c]:
+                    if run_start == -1:
+                        run_start = c
+                    cur_len = c - run_start + 1
+                    if cur_len > run_best:
+                        run_best = cur_len
+                        run_left, run_right = run_start, c
+                else:
+                    run_start = -1
+            if run_best == 0:
+                continue
+            area = band * run_best
+            # density inside the candidate rectangle
+            density = mask[top:bottom + 1, run_left:run_right + 1].mean()
+            score = density * area
+            if score > best[4]:
+                best = (top, bottom, run_left, run_right, score)
+    return best[0], best[1], best[2], best[3]
+
+
+def _infer_header_and_genecol(top: int, left: int) -> Tuple[int, int]:
+    """Pick the sample-header row and gene-name column adjacent to the block."""
+    header_row = top - 1 if top > 0 else -1
+    gene_col = left - 1 if left > 0 else -1
+    return header_row, gene_col
+
+
+# Words that appear in the corner cell diagonally above-left of the data block
+# (the "label of labels", e.g. the ``gene`` in ``gene,0,5,10``). If the block's
+# top row is really a numeric header row (sample names that happen to be
+# numbers), this word is the giveaway that the row belongs to the header.
+_HEADER_CORNER = {"", "gene", "genes", "sample", "samples", "id", "probe_id",
+                  "target", "name", "symbol", "description"}
+
+
+def _refine_block_edges(
+    raw: pd.DataFrame, top: int, bottom: int, left: int,
+) -> Tuple[int, int]:
+    """Pull an absorbed numeric header row / gene column out of the block.
+
+    A header row whose sample names are numbers (time points ``0,5,10``) is
+    otherwise indistinguishable from a data row, so the dense-block finder
+    merges it in. Detect it: the cell diagonally above-left of the block is a
+    non-numeric header-corner word while the column below it holds gene names.
+    """
+    gene_col = left - 1
+    if top == 0 and gene_col >= 0:
+        corner = str(raw.values[top, gene_col]).strip().lower()
+        if corner in _HEADER_CORNER:
+            below = raw.values[top + 1:bottom + 1, gene_col].astype(str)
+            if below.size and np.vectorize(_is_number_cell)(below).mean() < 0.3:
+                return top + 1, left
+    return top, left
+
+
+def _infer_orientation(
+    raw: pd.DataFrame,
+    top: int, bottom: int, left: int, right: int,
+    header_row: int, gene_col: int,
+) -> Tuple[bool, str, List[str]]:
+    """Decide whether the raw block is samples×genes (needs transpose).
+
+    Evidence, in priority order:
+      1. annotation position: a gene-name column hanging off the left labels
+         the *rows* (genes already = rows); a gene-name row above labels the
+         *columns* (genes = columns -> transpose).
+      2. shape: the gene axis is usually much longer than the sample axis.
+    Returns ``(transposed, confidence, notes)``.
+    """
+    notes: List[str] = []
+    nrows = bottom - top + 1
+    ncols = right - left + 1
+
+    # --- evidence 1: does the left-adjacent column look like gene names? ---
+    left_is_labels = False
+    if gene_col >= 0:
+        col_vals = raw.values[top:bottom + 1, gene_col].astype(str)
+        frac_non_numeric = 1.0 - np.vectorize(_is_number_cell)(col_vals).mean()
+        left_is_labels = frac_non_numeric >= 0.6
+
+    # --- evidence 2: does the row above the block look like gene names? ---
+    top_is_labels = False
+    if header_row >= 0:
+        row_vals = raw.values[header_row, left:right + 1].astype(str)
+        frac_non_numeric = 1.0 - np.vectorize(_is_number_cell)(row_vals).mean()
+        top_is_labels = frac_non_numeric >= 0.6
+
+    if left_is_labels and not top_is_labels:
+        notes.append("gene-name column on the left -> rows are genes")
+        return False, "high", notes
+    if top_is_labels and not left_is_labels:
+        notes.append("gene-name row above -> columns are genes (will transpose)")
+        return True, "high", notes
+
+    # --- evidence 3: shape fallback ---
+    if nrows > ncols * 1.5:
+        notes.append(f"block taller than wide ({nrows}×{ncols}) -> rows are genes")
+        return False, "medium", notes
+    if ncols > nrows * 1.5:
+        notes.append(f"block wider than tall ({nrows}×{ncols}) -> columns are genes (will transpose)")
+        return True, "medium", notes
+
+    # --- ambiguous ---
+    notes.append(
+        f"orientation ambiguous ({nrows}×{ncols}); defaulting to rows=genes, "
+        "override with str_col_num/index_col if wrong")
+    return False, "low", notes
+
+
+def _auto_detect_structure(
+    raw: pd.DataFrame,
+) -> Optional[Tuple[TableStructure, pd.DataFrame, List[str], List[str]]]:
+    """Full detection pipeline on a header=None string grid.
+
+    Returns ``(structure, numeric_block, gene_names, sample_names)`` or ``None``
+    if no numeric block was found. ``numeric_block`` is the raw string slice of
+    the expression matrix (still in its original orientation).
+    """
+    mask = _numeric_mask(raw)
+    if mask.mean() < 0.05:
+        return None
+    top, bottom, left, right = _find_dense_block(mask)
+    if bottom < top or right < left:
+        return None
+
+    top, left = _refine_block_edges(raw, top, bottom, left)
+    header_row, gene_col = _infer_header_and_genecol(top, left)
+    transposed, confidence, notes = _infer_orientation(
+        raw, top, bottom, left, right, header_row, gene_col)
+
+    # gene names: column left of block (rows=genes) or row above (cols=genes)
+    if gene_col >= 0 and not transposed:
+        gene_names = raw.values[top:bottom + 1, gene_col].astype(str).tolist()
+    elif transposed and header_row >= 0:
+        gene_names = raw.values[header_row, left:right + 1].astype(str).tolist()
+    else:
+        gene_names = [f"gene_{i}" for i in range(
+            bottom - top + 1 if not transposed else right - left + 1)]
+
+    # sample names: row above block (rows=genes) or column left (cols=genes)
+    if (header_row >= 0) and not transposed:
+        sample_names = raw.values[header_row, left:right + 1].astype(str).tolist()
+    elif transposed and gene_col >= 0:
+        sample_names = raw.values[top:bottom + 1, gene_col].astype(str).tolist()
+    else:
+        sample_names = [f"sample_{j}" for j in range(
+            right - left + 1 if not transposed else bottom - top + 1)]
+
+    block = raw.iloc[top:bottom + 1, left:right + 1]
+
+    structure = TableStructure(
+        data_top=top, data_bottom=bottom, data_left=left, data_right=right,
+        header_row=header_row, gene_col=gene_col, transposed=transposed,
+        confidence=confidence, notes=notes)
+    return structure, block, gene_names, sample_names
 
 
 def import_data(
@@ -117,17 +357,63 @@ def import_data(
     if file_delimiter is None:
         file_delimiter = _DELIMITERS.get(ext) or _sniff_delimiter(file_path)
 
-    header_tf: Optional[int] = 0 if header_path is None else None
-    df = pd.read_csv(file_path, sep=file_delimiter, header=header_tf,
-                     engine="python" if file_delimiter == r"\s+" else "c")
+    # When the user pins any structural parameter, honour it exactly (legacy
+    # path). Otherwise auto-detect orientation, header row and gene column.
+    use_legacy = (str_col_num is not None or float_col_num is not None
+                  or header_path is not None or index_col != 1)
 
-    header_list = None
-    if header_path is not None:
-        with open(header_path, "r") as fh:
-            header_list = fh.readline().strip().split(header_delimiter)
+    if use_legacy:
+        header_tf: Optional[int] = 0 if header_path is None else None
+        df = pd.read_csv(file_path, sep=file_delimiter, header=header_tf,
+                         engine="python" if file_delimiter == r"\s+" else "c")
+        header_list = None
+        if header_path is not None:
+            with open(header_path, "r") as fh:
+                header_list = fh.readline().strip().split(header_delimiter)
+        return _parse_table(df, str_col_num, float_col_num, index_col,
+                            None, header_delimiter, header_list=header_list)
 
-    return _parse_table(df, str_col_num, float_col_num, index_col,
-                        None, header_delimiter, header_list=header_list)
+    # --- auto-detect path: read the whole grid as raw strings ----------------
+    raw = pd.read_csv(file_path, sep=file_delimiter, header=None, dtype=str,
+                      na_filter=False,
+                      engine="python" if file_delimiter == r"\s+" else "c")
+    detected = _auto_detect_structure(raw)
+    if detected is None:
+        raise ValueError(
+            "Could not find a contiguous numeric expression block in "
+            f"{file_path!r}. If the file has a non-standard layout, pin it "
+            "explicitly with str_col_num / index_col / float_col_num.")
+    structure, block, gene_names, sample_names = detected
+
+    print(f"[auto-detect] header_row={structure.header_row}, "
+          f"gene_col={structure.gene_col}, transposed={structure.transposed}, "
+          f"confidence={structure.confidence}")
+    for note in structure.notes:
+        print(f"             - {note}")
+
+    rna_df = _build_from_detection(structure, block, gene_names, sample_names)
+    rna_df.attrs["clusmap_detected"] = structure
+    print(f"Data imported: {rna_df.shape[0]} genes x {rna_df.shape[1]} samples")
+    return _finalize(rna_df)
+
+
+def _build_from_detection(
+    structure: TableStructure, block: pd.DataFrame,
+    gene_names: List[str], sample_names: List[str],
+) -> pd.DataFrame:
+    """Assemble a genes×samples DataFrame from a detection result.
+
+    ``block`` is the raw string slice of the numeric region in its *original*
+    orientation; transpose it if the detector decided the genes ran along the
+    columns.
+    """
+    values = block.apply(pd.to_numeric, errors="coerce")
+    if structure.transposed:
+        values = values.T
+    values = values.astype(float)
+    values.index = [str(g) for g in gene_names]
+    values.columns = [str(s) for s in sample_names]
+    return values
 
 
 def _parse_table(df, str_col_num, float_col_num, index_col, header_path,

@@ -233,11 +233,21 @@ class ToolSession:
     def _t_load_data(self, file_path):
         self.rna = cm.import_data(file_path)
         prev = self.rna.iloc[:3, :min(4, self.rna.shape[1])]
-        return json.dumps({
+        out = {
             "genes": int(self.rna.shape[0]), "samples": int(self.rna.shape[1]),
             "sample_names": list(map(str, self.rna.columns[:12])),
             "preview": prev.round(2).to_dict(),
-        })
+        }
+        detected = self.rna.attrs.get("clusmap_detected")
+        if detected is not None:
+            out["detected"] = {
+                "header_row": detected.header_row,
+                "gene_col": detected.gene_col,
+                "transposed": detected.transposed,
+                "confidence": detected.confidence,
+                "notes": detected.notes,
+            }
+        return json.dumps(out)
 
     def _t_preprocess(self, min_expr=10, log_base=2):
         if self.rna is None:

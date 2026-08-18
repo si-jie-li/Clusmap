@@ -14,7 +14,7 @@ Typical use
 every downstream output.
 """
 from .io import (set_working_directory, import_data, preprocess,
-                 extract_color_cat)
+                 extract_color_cat, TableStructure)
 from .state import ModuleState
 from .cluster import gen_mod
 from .plot import bulk_hm, cluster_sample_stats
@@ -33,7 +33,7 @@ __version__ = "0.2.0"
 
 __all__ = [
     "set_working_directory", "import_data", "preprocess", "extract_color_cat",
-    "ModuleState", "gen_mod", "bulk_hm", "cluster_sample_stats",
+    "TableStructure", "ModuleState", "gen_mod", "bulk_hm", "cluster_sample_stats",
     "compute_pseudo_bulk", "pseudo_bulk_hm", "sc_marker_hm",
     "celltype_selection", "mod_GO", "module_motif", "run_pipeline_from_config",
     "motif_pipeline", "prepare_module_fastas", "run_ame", "config",
